@@ -20,6 +20,14 @@ impl Region {
         *app.state::<Self>()
     }
 
+    /// Mac-specific text: Simplified Chinese for the CN app, Traditional Chinese for Global.
+    pub fn text(self, cn: &'static str, global: &'static str) -> &'static str {
+        match self {
+            Self::Cn => cn,
+            Self::Global => global,
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::Cn => "Wuwa Tappo CN Mac",
@@ -54,6 +62,12 @@ impl Region {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mac_text_follows_the_regional_script() {
+        assert_eq!(Region::Cn.text("设置", "設定"), "设置");
+        assert_eq!(Region::Global.text("设置", "設定"), "設定");
+    }
 
     #[test]
     fn only_explicit_app_identities_select_a_region() {

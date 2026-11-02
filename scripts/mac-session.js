@@ -6,6 +6,8 @@
   if (!localApp || window.__WUWATAPPO_SESSION__) return;
 
   const secureKeys = new Set(['__KrSDK_USER_TOKEN__', '__KrSDK_USER_INFO__', 'overseas-pending-role-select']);
+  // The Global app shows its Mac-specific text in Traditional Chinese.
+  const traditional = window.__WUWATAPPO_PROFILE__?.region === 'GLOBAL';
   const persistence = initial.persistence ?? 'keychain';
   const originalStorage = window.localStorage;
   const rawGet = originalStorage.getItem.bind(originalStorage);
@@ -65,10 +67,12 @@
       banner.style.cssText = 'position:fixed;z-index:2147483647;left:16px;right:16px;top:16px;padding:16px;border-radius:12px;background:#fff2e5;color:#5b2400;font:14px/1.5 system-ui;box-shadow:0 4px 24px #0003;pointer-events:auto';
       const text = document.createElement('div');
       text.textContent = persistence === 'memory'
-        ? 'Sign-in session could not be synchronized. Retry to continue.'
-        : 'Sign-in could not be saved securely. Unlock your login keychain, then retry.';
+        ? (traditional ? '無法同步登入資訊，請重試以繼續。' : 'Sign-in session could not be synchronized. Retry to continue.')
+        : (traditional ? '無法安全保存登入資訊。請解鎖「登入」鑰匙圈後再試一次。' : 'Sign-in could not be saved securely. Unlock your login keychain, then retry.');
       const retry = document.createElement('button');
-      retry.textContent = persistence === 'memory' ? 'Retry session' : 'Retry saving';
+      retry.textContent = persistence === 'memory'
+        ? (traditional ? '重試' : 'Retry session')
+        : (traditional ? '重新保存' : 'Retry saving');
       retry.addEventListener('click', () => { retrySession().catch(showFailure); });
       banner.append(text, retry);
       (document.body || document.documentElement).appendChild(banner);

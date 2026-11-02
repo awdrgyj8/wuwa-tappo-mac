@@ -68,7 +68,7 @@ test('prepared resources preserve the selected region and contain its macOS adap
   assert.ok(preparedAbout.includes(profile.productName));
   const bootstrap = await readFile(path.join(root, profile.preparedDir, 'bootstrap.html'), 'utf8');
   assert.ok(bootstrap.includes(`<title>${profile.productName}</title>`));
-  assert.ok(bootstrap.includes(`Wuwa Tappo · ${profile.label}`));
+  assert.ok(bootstrap.includes(`Wuwa Tappo · ${profile.region === 'GLOBAL' ? '國際服' : profile.label}`));
   if (profile.region === 'GLOBAL') {
     assert.ok(preparedMain.includes('listen("mac-oauth-callback-ready"'));
     assert.equal(preparedMain.includes('listen("deep-link://new-url"'), false);

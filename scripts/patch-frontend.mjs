@@ -58,9 +58,10 @@ export function patchMacUpdateFeedback(source) {
   return source.replace(pattern, (_, error, before, target) => `if(${error}.kind==="error"){${before}${target}.value=${error}.message||n("setting_version_check_failed");return}`);
 }
 
-export function patchMacUpdater(source) {
+export function patchMacUpdater(source, region = 'CN') {
   const resolver = 'async function resolveUpdaterLatestJsonUrl(){const e=resolveUpdaterLatestHostJsonUrl();if(!e)return null;';
-  const recovery = 'async function resolveUpdaterLatestJsonUrl(){let e=resolveUpdaterLatestHostJsonUrl();if(!e){const config=unwrapApiData(await activityInfo());const host=typeof config?.assets_host==="string"?config.assets_host.trim():"";if(!host||host===LOCAL_ROLE_ASSETS_HOST)throw new Error("官方配置缺少更新资源地址");setUpdaterAssetsHost(host,{triggerSilentCheck:!1});e=resolveUpdaterLatestHostJsonUrl()}';
+  const missingHost = region === 'GLOBAL' ? '官方設定缺少更新資源位址' : '官方配置缺少更新资源地址';
+  const recovery = `async function resolveUpdaterLatestJsonUrl(){let e=resolveUpdaterLatestHostJsonUrl();if(!e){const config=unwrapApiData(await activityInfo());const host=typeof config?.assets_host==="string"?config.assets_host.trim():"";if(!host||host===LOCAL_ROLE_ASSETS_HOST)throw new Error("${missingHost}");setUpdaterAssetsHost(host,{triggerSilentCheck:!1});e=resolveUpdaterLatestHostJsonUrl()}`;
   const failure = 'if(logDiagnostic("UPDATE","check_failed",{stage:"check",reason_code:diagnosticErrorCode(t),fallback:e?.interactive?"report_error":"treat_as_latest"},"warn"),e?.interactive)return{kind:"error",message:n};try{const s=await getVersion();return console.warn("[updater] check skipped (treat as latest)",t),{kind:"none",currentVersion:s}}catch{return{kind:"error",message:n}}';
   const report = 'return logDiagnostic("UPDATE","check_failed",{stage:"check",reason_code:diagnosticErrorCode(t),fallback:"report_error"},"warn"),{kind:"error",message:n}';
   for (const original of [resolver, failure]) {
@@ -77,12 +78,36 @@ export function patchMacAbout(source, region = 'CN') {
   if (remotes.length !== 1) throw new Error('Original remote About content changed; reconcile the Mac build information before building.');
   const [remote, computed] = remotes[0];
   const info = region === 'GLOBAL'
-    ? `<h2 ${scope}>macOS community build</h2><p ${scope}>Wuwa Tappo Global Mac · Unofficial · Apple Silicon · macOS 13+</p>`
+    ? `<h2 ${scope}>macOS 重製版</h2><p ${scope}>Wuwa Tappo Global Mac · 非官方重製 · Apple Silicon · macOS 13 以上</p>`
     : `<h2 ${scope}>macOS 重建版</h2><p ${scope}>Wuwa Tappo CN Mac · 非官方重建 · Apple Silicon · macOS 13 及以上</p>`;
   const banner = `<section class="about-section" ${scope}>${info}</section>`;
+  const windowsHeading = region === 'GLOBAL' ? 'Windows 原版系統配備' : 'Windows 原版系统配置';
   return source
-    .replace(original, `${info}<h3 ${scope}>Windows 原版系统配置</h3>`)
+    .replace(original, `${info}<h3 ${scope}>${windowsHeading}</h3>`)
     .replace(remote, `t=${computed}(()=>{const html=k("about_content")?String(v("about_content")).trim():"";return html?${JSON.stringify(banner)}+html.replace("系统配置","Windows 原版系统配置").replace("系統配備","Windows 原版系統配備"):""})`);
+}
+
+// The startup page asks how to keep sign-in information before any frontend loads.
+export function prepareBootstrap(html, profile) {
+  const changed = 'Startup page template changed; reconcile its regional text before building.';
+  const replacements = [
+    ['<title>Wuwa Tappo CN Mac</title>', `<title>${profile.productName}</title>`],
+  ];
+  if (profile.region === 'GLOBAL') {
+    replacements.push(
+      ['<html lang="zh-CN">', '<html lang="zh-Hant">'],
+      ['<h1>Wuwa Tappo · 国服</h1>', '<h1>Wuwa Tappo · 國際服</h1>'],
+      ['<p id="status">仅本次会话：登录信息只保存在内存，退出后清除。\n记住登录：使用 macOS 钥匙串，需要系统授权。</p>',
+        '<p id="status">僅限本次：登入資訊只保存在記憶體，結束後清除。\n記住登入：使用 macOS 鑰匙圈，需要系統授權。</p>'],
+      ['<button id="quit">退出</button><button id="keychain">记住登录</button><button id="memory">仅本次会话</button>',
+        '<button id="quit">結束</button><button id="keychain">記住登入</button><button id="memory">僅限本次</button>'],
+    );
+  } else replacements.push(['<h1>Wuwa Tappo · 国服</h1>', `<h1>Wuwa Tappo · ${profile.label}</h1>`]);
+  for (const [original, replacement] of replacements) {
+    if (html.split(original).length !== 2) throw new Error(changed);
+    html = html.replace(original, replacement);
+  }
+  return html;
 }
 
 export function patchGlobalAuthListener(source) {

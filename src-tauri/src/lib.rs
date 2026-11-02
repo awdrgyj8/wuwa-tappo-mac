@@ -41,10 +41,11 @@ fn startup_status(app: &tauri::AppHandle) -> Value {
         .mode
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let region = profile::Region::from_app(app);
     let message=error.unwrap_or_else(||match (loading,mode) {
-        (true,Some(startup::SessionMode::Keychain))=>"正在读取登录信息…\n请在 macOS 的钥匙串提示中自行处理授权。".into(),
-        (true,_)=>"正在启动，仅本次会话保存登录信息…".into(),
-        _=>"仅本次会话：登录信息只保存在内存，退出后清除。\n记住登录：使用 macOS 钥匙串，需要系统授权。".into(),
+        (true,Some(startup::SessionMode::Keychain))=>region.text("正在读取登录信息…\n请在 macOS 的钥匙串提示中自行处理授权。","正在讀取登入資訊…\n請在 macOS 的鑰匙圈提示中自行處理授權。").into(),
+        (true,_)=>region.text("正在启动，仅本次会话保存登录信息…","正在啟動，登入資訊只保存於本次使用期間…").into(),
+        _=>region.text("仅本次会话：登录信息只保存在内存，退出后清除。\n记住登录：使用 macOS 钥匙串，需要系统授权。","僅限本次：登入資訊只保存在記憶體，結束後清除。\n記住登入：使用 macOS 鑰匙圈，需要系統授權。").into(),
     });
     serde_json::json!({"loading":loading,"message":message,"mode":mode})
 }
@@ -55,7 +56,12 @@ fn begin_session(
     remember_choice: bool,
 ) -> Result<(), String> {
     if app.try_state::<session::SessionStore>().is_some() {
-        return Err("已有登录会话。请先退出应用，再重新启动并选择登录信息保存方式。".into());
+        return Err(profile::Region::from_app(&app)
+            .text(
+                "已有登录会话。请先退出应用，再重新启动并选择登录信息保存方式。",
+                "已有登入工作階段。請先結束 App，再重新啟動並選擇登入資訊的保存方式。",
+            )
+            .into());
     }
     if app
         .state::<StartupState>()
@@ -104,7 +110,12 @@ fn begin_session(
         let scheduling = app.run_on_main_thread(move || {
             let result = (|| -> Result<(), String> {
                 if !handle.manage(session?) {
-                    return Err("已有登录会话，无法更换保存方式。请退出应用后重试。".into());
+                    return Err(profile::Region::from_app(&handle)
+                        .text(
+                            "已有登录会话，无法更换保存方式。请退出应用后重试。",
+                            "已有登入工作階段，無法變更保存方式。請結束 App 後再試一次。",
+                        )
+                        .into());
                 }
                 windows::setup(&handle)?;
                 if let Err(error) = input::start(handle.clone()) {
@@ -122,7 +133,11 @@ fn begin_session(
             state.loading.store(false, Ordering::Release);
             if let Err(error) = result {
                 eprintln!("App startup failed: {error}");
-                let message = format!("无法读取登录信息或启动应用。\n{error}");
+                let message = format!(
+                    "{}\n{error}",
+                    profile::Region::from_app(&handle)
+                        .text("无法读取登录信息或启动应用。", "無法讀取登入資訊或啟動 App。")
+                );
                 if let Ok(mut failure) = state.error.lock() {
                     *failure = Some(message.clone());
                 }
@@ -312,7 +327,10 @@ pub fn run() {
             if explicit_memory {
                 begin_session(handle, startup::SessionMode::Memory, true)?;
             } else if !choose {
-                match startup::load_mode(&app.path().app_config_dir()?.join("session-mode.json")) {
+                match startup::load_mode(
+                    &app.path().app_config_dir()?.join("session-mode.json"),
+                    profile::Region::from_app(&handle),
+                ) {
                     Ok(Some(mode)) => begin_session(handle, mode, false)?,
                     Ok(None) => {}
                     Err(error) => {
@@ -333,7 +351,7 @@ pub fn run() {
             if let Some(mtm) = objc2::MainThreadMarker::new() {
                 let alert = objc2_app_kit::NSAlert::new(mtm);
                 alert.setMessageText(&objc2_foundation::NSString::from_str(
-                    "Wuwa Tappo Mac 无法启动",
+                    region.text("Wuwa Tappo Mac 无法启动", "Wuwa Tappo Mac 無法啟動"),
                 ));
                 alert.setInformativeText(&objc2_foundation::NSString::from_str(&error.to_string()));
                 alert.runModal();

@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Mutex;
+use crate::profile::Region;
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, MenuItemKind, PredefinedMenuItem, Submenu},
     tray::{TrayIcon, TrayIconBuilder},
@@ -10,8 +11,6 @@ use tauri::{
 const TRAY_ID: &str = "wuwatappo-mac-tray";
 const SCALE_PRESETS: [u32; 7] = [50, 75, 100, 125, 150, 175, 200];
 const OPACITY_PRESETS: [u32; 5] = [0, 25, 50, 75, 100];
-const AUTO_CHEST_LABEL: &str = "自动领取宝箱（每 30 分钟）";
-const AUTO_CHEST_CLEAR_LABEL: &str = "清空领取记录";
 const AUTO_CHEST_RECORD_PREFIX: &str = "auto-chest-record-";
 const AUTO_CHEST_ENTRY_LIMIT: usize = 5;
 const AUTO_CHEST_TEXT_LIMIT: usize = 120;
@@ -33,6 +32,31 @@ struct Labels {
     restart: String,
     quit: String,
     tray_tooltip: String,
+}
+
+impl Labels {
+    /// Shown until the official frontend sends its translated labels.
+    fn for_region(region: Region) -> Self {
+        if region == Region::Cn {
+            return Self::default();
+        }
+        Self {
+            open_bag: "背包".into(),
+            open_atlas: "圖鑑".into(),
+            open_exchange: "合成".into(),
+            open_room: "連線".into(),
+            hide_pet: "隱藏桌寵".into(),
+            show_pet: "顯示桌寵".into(),
+            tray_open_settings: "設定".into(),
+            dock_settings: "設定".into(),
+            window_size: "桌寵大小".into(),
+            window_passthrough: "滑鼠穿透".into(),
+            window_opacity: "不透明度".into(),
+            restart: "重新啟動".into(),
+            quit: "結束 Wuwa Tappo".into(),
+            tray_tooltip: "Wuwa Tappo".into(),
+        }
+    }
 }
 
 impl Default for Labels {
@@ -211,10 +235,11 @@ fn auto_chest_items(
     app: &AppHandle,
     chest: &AutoChestMenu,
 ) -> tauri::Result<Vec<MenuItemKind<tauri::Wry>>> {
+    let region = Region::from_app(app);
     let mut items = vec![checked(
         app,
         "toggle-auto-chest",
-        AUTO_CHEST_LABEL,
+        region.text("自动领取宝箱（每 30 分钟）", "自動領取寶箱（每 30 分鐘）"),
         chest.enabled,
     )?];
     if !chest.summary.is_empty() {
@@ -228,7 +253,11 @@ fn auto_chest_items(
         )?);
     }
     if !chest.entries.is_empty() {
-        items.push(normal(app, "clear-auto-chest", AUTO_CHEST_CLEAR_LABEL)?);
+        items.push(normal(
+            app,
+            "clear-auto-chest",
+            region.text("清空领取记录", "清除領取紀錄"),
+        )?);
     }
     items.push(MenuItemKind::Predefined(PredefinedMenuItem::separator(
         app,
@@ -243,6 +272,7 @@ fn context_items(
     tray: bool,
 ) -> tauri::Result<Vec<MenuItemKind<tauri::Wry>>> {
     let labels = &options.labels;
+    let region = Region::from_app(app);
     let visibility = if options.pet_dock_visible {
         &labels.hide_pet
     } else {
@@ -286,8 +316,12 @@ fn context_items(
             options.window_passthrough,
         )?,
         MenuItemKind::Predefined(PredefinedMenuItem::separator(app)?),
-        normal(app, "input-access", "启用键鼠监听…")?,
-        normal(app, "open-logs", "查看日志")?,
+        normal(
+            app,
+            "input-access",
+            region.text("启用键鼠监听…", "啟用鍵盤滑鼠監聽…"),
+        )?,
+        normal(app, "open-logs", region.text("查看日志", "檢視記錄檔"))?,
         MenuItemKind::Predefined(PredefinedMenuItem::separator(app)?),
         normal(app, "restart", &labels.restart)?,
         normal(app, "quit", &labels.quit)?,
@@ -313,18 +347,21 @@ fn application_menu(
     options: &MenuOptions,
     chest: Option<&AutoChestMenu>,
 ) -> tauri::Result<Menu<tauri::Wry>> {
-    let application = Submenu::new(app, crate::profile::Region::from_app(app).name(), true)?;
+    let region = Region::from_app(app);
+    let application = Submenu::new(app, region.name(), true)?;
     application.append(&MenuItem::with_id(
         app,
         "open-about",
-        "关于 Wuwa Tappo",
+        region.text("关于 Wuwa Tappo", "關於 Wuwa Tappo"),
         true,
         None::<&str>,
     )?)?;
     let session_label = match app.try_state::<crate::session::SessionStore>() {
-        Some(session) if session.is_ephemeral() => "登录信息：仅本次会话",
-        Some(_) => "登录信息：钥匙串",
-        None => "登录信息：尚未选择",
+        Some(session) if session.is_ephemeral() => {
+            region.text("登录信息：仅本次会话", "登入資訊：僅限本次")
+        }
+        Some(_) => region.text("登录信息：钥匙串", "登入資訊：鑰匙圈"),
+        None => region.text("登录信息：尚未选择", "登入資訊：尚未選擇"),
     };
     application.append(&MenuItem::with_id(
         app,
@@ -344,7 +381,7 @@ fn application_menu(
     application.append(&MenuItem::with_id(
         app,
         "input-access",
-        "启用键鼠监听…",
+        region.text("启用键鼠监听…", "啟用鍵盤滑鼠監聽…"),
         true,
         None::<&str>,
     )?)?;
@@ -363,7 +400,7 @@ fn application_menu(
 
     let edit = Submenu::with_items(
         app,
-        "编辑",
+        region.text("编辑", "編輯"),
         true,
         &[
             &PredefinedMenuItem::undo(app, None)?,
@@ -426,7 +463,10 @@ fn event_for_id(id: &str) -> Option<(&'static str, Value)> {
 }
 
 pub fn setup(app: &AppHandle) -> Result<(), String> {
-    let options = MenuOptions::default();
+    let options = MenuOptions {
+        labels: Labels::for_region(Region::from_app(app)),
+        ..MenuOptions::default()
+    };
     let tray_menu = context_menu(app, &options, None, true).map_err(|e| e.to_string())?;
     let context = context_menu(app, &options, None, false).map_err(|e| e.to_string())?;
     let icon = app.default_window_icon().cloned().ok_or("Application icon is unavailable")?;
@@ -624,6 +664,15 @@ mod tests {
         assert!(AutoChestMenu::from_args(&json!({ "entries": vec!["x"; 6] })).is_err());
         assert!(AutoChestMenu::from_args(&json!({ "summary": "x".repeat(121) })).is_err());
         assert!(AutoChestMenu::from_args(&json!({ "enabled": "yes" })).is_err());
+    }
+
+    #[test]
+    fn global_menu_defaults_are_traditional_until_the_frontend_syncs() {
+        let global = Labels::for_region(Region::Global);
+        assert_eq!(global.open_atlas, "圖鑑");
+        assert_eq!(global.tray_open_settings, "設定");
+        assert_eq!(global.window_passthrough, "滑鼠穿透");
+        assert_eq!(Labels::for_region(Region::Cn).open_atlas, "图鉴");
     }
 
     #[test]

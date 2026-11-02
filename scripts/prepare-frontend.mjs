@@ -2,7 +2,7 @@ import { cp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { getRegionProfile } from './regions.mjs';
-import { patchSessionBarriers, patchLoginReady, patchDomesticSdkUrls, patchMacUpdateFeedback, patchMacUpdater, patchMacAbout, patchDomesticLoginReload, patchGlobalAuthListener, patchMacLayoutBarriers, patchMacAutoChest, patchMacAutoChestNames, patchMacEmotionMenuIdle } from './patch-frontend.mjs';
+import { patchSessionBarriers, patchLoginReady, patchDomesticSdkUrls, patchMacUpdateFeedback, patchMacUpdater, patchMacAbout, patchDomesticLoginReload, patchGlobalAuthListener, patchMacLayoutBarriers, patchMacAutoChest, patchMacAutoChestNames, patchMacEmotionMenuIdle, prepareBootstrap } from './patch-frontend.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const profile = getRegionProfile();
@@ -16,7 +16,7 @@ const files = new Map(await Promise.all((await readdir(path.join(source, 'assets
   .map(async name => [`assets/${name}`, await readFile(path.join(source, 'assets', name), 'utf8')])));
 const original = files.get(entry);
 if (!original?.includes(`const APP_REGION="${profile.region}"`)) throw new Error(`Expected official ${profile.region} frontend.`);
-let main = patchMacUpdater(original);
+let main = patchMacUpdater(original, profile.region);
 main = profile.region === 'CN' ? patchDomesticSdkUrls(main) : patchGlobalAuthListener(main);
 files.set(entry, patchMacAutoChestNames(patchSessionBarriers(main)));
 
@@ -40,8 +40,6 @@ await mkdir(output, { recursive: true });
 await cp(source, output, { recursive: true });
 await writeFile(path.join(output, 'index.html'), profile.region === 'CN' ? index.replace('<html lang="en">', '<html lang="zh-CN">') : index);
 const bootstrap = await readFile(path.join(root, 'scripts/bootstrap.html'), 'utf8');
-await writeFile(path.join(output, 'bootstrap.html'), bootstrap
-  .replace('<title>Wuwa Tappo CN Mac</title>', `<title>${profile.productName}</title>`)
-  .replace('<h1>Wuwa Tappo · 国服</h1>', `<h1>Wuwa Tappo · ${profile.label}</h1>`));
+await writeFile(path.join(output, 'bootstrap.html'), prepareBootstrap(bootstrap, profile));
 for (const [name, content] of files) await writeFile(path.join(output, name), content);
 console.log(`Prepared official ${profile.region} frontend at ${output}`);

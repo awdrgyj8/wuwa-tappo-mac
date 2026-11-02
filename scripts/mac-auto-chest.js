@@ -9,8 +9,11 @@
   const MAX_RECORDS = 100;
   const MENU_ENTRIES = 5;
   const PLACES = ['left', 'right'];
-  const TYPE_LABELS = { character_skin: '角色', accessory: '饰品', emote: '表情' };
-  const RARITY_LABELS = { common: '绿', uncommon: '蓝', rare: '紫', epic: '金' };
+  // Simplified Chinese for the CN app, Traditional Chinese for Global.
+  const traditional = window.__WUWATAPPO_PROFILE__?.region === 'GLOBAL';
+  const T = (cn, global) => (traditional ? global : cn);
+  const TYPE_LABELS = { character_skin: '角色', accessory: T('饰品', '飾品'), emote: '表情' };
+  const RARITY_LABELS = { common: T('绿', '綠'), uncommon: T('蓝', '藍'), rare: '紫', epic: '金' };
 
   let view = null;
   let resolveName = null;
@@ -59,7 +62,7 @@
       const resolved = text(resolveName?.(type, name));
       if (resolved) return resolved;
     } catch {}
-    return text(name) || '未知奖励';
+    return text(name) || T('未知奖励', '未知獎勵');
   }
 
   const pad = value => String(value).padStart(2, '0');
@@ -70,15 +73,19 @@
   }
 
   function menuPayload(state) {
-    if (!account) return { enabled: state.enabled, summary: '登录后才会自动领取宝箱', entries: [] };
+    if (!account) return { enabled: state.enabled, summary: T('登录后才会自动领取宝箱', '登入後才會自動領取寶箱'), entries: [] };
     const mine = state.records.filter(record => record.account === account);
     if (!mine.length) {
-      return { enabled: state.enabled, summary: state.enabled ? '暂无领取记录，冷却结束后自动领取' : '暂无领取记录', entries: [] };
+      return {
+        enabled: state.enabled,
+        summary: state.enabled ? T('暂无领取记录，冷却结束后自动领取', '尚無領取紀錄，冷卻結束後自動領取') : T('暂无领取记录', '尚無領取紀錄'),
+        entries: [],
+      };
     }
     const total = mine.length >= MAX_RECORDS ? `${MAX_RECORDS}+` : String(mine.length);
     return {
       enabled: state.enabled,
-      summary: `已自动领取 ${total} 件，最近获得：`,
+      summary: T(`已自动领取 ${total} 件，最近获得：`, `已自動領取 ${total} 件，最近獲得：`),
       entries: mine.slice(0, MENU_ENTRIES).map(formatRecord),
     };
   }
