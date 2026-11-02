@@ -57,6 +57,7 @@ pub const COMMANDS: &[&str] = &[
     "sync_aux_windows_to_main_monitor",
     "sync_main_window_to_current_monitor",
     "sync_native_menu",
+    "sync_auto_chest_menu",
     "login_window_ready",
 ];
 
@@ -113,10 +114,11 @@ fn main_window(app: &AppHandle) -> Result<WebviewWindow, String> {
 fn initialize(app: &AppHandle, label: &str) -> Result<String, String> {
     let script = app.state::<SessionStore>().initialization_script()?;
     let mut initialization = format!(
-        "{}\n{script}\n{}\n{}",
+        "{}\n{script}\n{}\n{}\n{}",
         crate::profile::Region::from_app(app).initialization_script(),
         include_str!("../../scripts/mac-websocket.js"),
-        include_str!("../../scripts/mac-platform.js")
+        include_str!("../../scripts/mac-platform.js"),
+        include_str!("../../scripts/mac-auto-chest.js")
     );
     if label == "main" && cfg!(debug_assertions) && std::env::args().any(|arg| arg == "--self-test")
     {
@@ -652,6 +654,12 @@ pub fn dispatch(
             w.show().map_err(err)?;
         }
         "sync_native_menu" => return crate::menu::sync(app, args),
+        "sync_auto_chest_menu" => {
+            if label != "main" {
+                return Err("Auto chest records require the pet window".into());
+            }
+            return crate::menu::sync_auto_chest(app, args);
+        }
         "popup_main_dock_context_menu" => {
             return crate::menu::popup(
                 app,

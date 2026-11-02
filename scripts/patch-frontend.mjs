@@ -138,4 +138,73 @@ export function patchMacLayoutBarriers(source) {
 }`;
   return helper + source;
 }
+
+function walkSyntax(node, callback, parent = null) {
+  if (!node || typeof node !== 'object') return;
+  callback(node, parent);
+  for (const value of Object.values(node)) {
+    if (Array.isArray(value)) value.forEach(child => walkSyntax(child, callback, node));
+    else if (value && typeof value === 'object' && typeof value.type === 'string') walkSyntax(value, callback, node);
+  }
+}
+
+function declaredNames(statements) {
+  const names = new Set();
+  for (const statement of statements) {
+    const declaration = statement.type === 'ExportNamedDeclaration' ? statement.declaration : statement;
+    if (declaration?.type === 'ImportDeclaration') declaration.specifiers.forEach(item => names.add(item.local.name));
+    else if (declaration?.type === 'VariableDeclaration') declaration.declarations.forEach(item => item.id.type === 'Identifier' && names.add(item.id.name));
+    else if (declaration?.type === 'FunctionDeclaration' || declaration?.type === 'ClassDeclaration') names.add(declaration.id.name);
+  }
+  return names;
+}
+
+const escapeRegExp = value => value.replace(/[$]/g, '\\$');
+
+// Expose the official chest click handler to scripts/mac-auto-chest.js. The handler
+// keeps its own cooldown, click-count, reward popup and bag refresh behaviour.
+export function patchMacAutoChest(source) {
+  const changed = 'Original chest opening flow changed; reconcile the Mac auto chest before building.';
+  const tree = parse(source, { sourceType: 'module', ecmaVersion: 'latest' });
+  const handlers = [];
+  walkSyntax(tree, (node, parent) => {
+    if (node.type !== 'FunctionDeclaration' || parent?.type !== 'BlockStatement') return;
+    const content = source.slice(node.start, node.end);
+    if (content.includes('"[chest] openChest failed"') && content.includes('click_num:')) handlers.push({ node, block: parent });
+  });
+  if (handlers.length !== 1) throw new Error(changed);
+  const [{ node, block }] = handlers;
+  const content = source.slice(node.start, node.end);
+  const head = /^async function ([$\w]+)\(([$\w]+)\)\{if\(([$\w]+)\(\)\)\{[$\w]+\([$\w]+\("update_force_lock_hint"\)\);return\}if\(([$\w]+)\.value\|\|([$\w]+)\.value\)return;/.exec(content);
+  if (!head) throw new Error(changed);
+  const [, handler, place, locked, busy, disabled] = head;
+  const p = escapeRegExp(place);
+  const gate = new RegExp(`if\\(!\\(${p}==="left"\\?([$\\w]+)\\.value:([$\\w]+)\\.value\\)\\)return;if\\(!([$\\w]+)\\.isLoggedIn\\)`).exec(content);
+  if (!gate) throw new Error(changed);
+  const [, left, right, store] = gate;
+  const s = escapeRegExp(store);
+  const minimum = new RegExp(`${s}\\.totalClickCount<([$\\w]+)\\)`).exec(content)?.[1];
+  const request = new RegExp(`\\{place:${p},click_num:${s}\\.cumulativeClickCount\\}`, 'g');
+  const rewards = [...content.matchAll(/[$\w]+\(\{itemId:([$\w]+)\.data\.asset_id,itemRarity:\1\.data\.rarity_type,itemType:\1\.assetType\}\)/g)];
+  if (!minimum || (content.match(request) ?? []).length !== 1 || rewards.length !== 1) throw new Error(changed);
+  const result = rewards[0][1];
+  if (!content.includes(`${result}.assetName`)) throw new Error(changed);
+  const local = declaredNames(block.body);
+  const module = declaredNames(tree.body);
+  if (![busy, disabled, left, right].every(name => local.has(name))
+    || ![locked, store, minimum].every(name => module.has(name) && !local.has(name))) throw new Error(changed);
+  const controller = 'window.__WUWATAPPO_AUTO_CHEST__';
+  const claimed = `${controller}?.claimed(${place},${result}.data,${result}.assetType,${result}.assetName),`;
+  const attach = `${controller}?.attach({open:${handler},snapshot:()=>({loggedIn:!!${store}.isLoggedIn,account:String(${store}.userInfo?.id??""),locked:!!${locked}(),busy:!!${busy}.value,disabled:!!${disabled}.value,left:!!${left}.value,right:!!${right}.value,clicks:Number(${store}.totalClickCount)||0,minimum:${minimum}})});`;
+  const reward = node.start + rewards[0].index;
+  return source.slice(0, reward) + claimed + source.slice(reward, node.end) + attach + source.slice(node.end);
+}
+
+export function patchMacAutoChestNames(source) {
+  const tree = parse(source, { sourceType: 'module', ecmaVersion: 'latest' });
+  if (tree.body.filter(node => node.type === 'FunctionDeclaration' && node.id.name === 'resolveAssetDisplayName').length !== 1) {
+    throw new Error('Original reward name resolver changed; reconcile the Mac auto chest records before building.');
+  }
+  return `${source}\n;window.__WUWATAPPO_AUTO_CHEST__?.useAssetNames(resolveAssetDisplayName);\n`;
+}
 import { parse } from 'acorn';

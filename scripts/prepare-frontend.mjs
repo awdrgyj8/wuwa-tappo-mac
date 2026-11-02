@@ -2,7 +2,7 @@ import { cp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { getRegionProfile } from './regions.mjs';
-import { patchSessionBarriers, patchLoginReady, patchDomesticSdkUrls, patchMacUpdateFeedback, patchMacUpdater, patchMacAbout, patchDomesticLoginReload, patchGlobalAuthListener, patchMacLayoutBarriers } from './patch-frontend.mjs';
+import { patchSessionBarriers, patchLoginReady, patchDomesticSdkUrls, patchMacUpdateFeedback, patchMacUpdater, patchMacAbout, patchDomesticLoginReload, patchGlobalAuthListener, patchMacLayoutBarriers, patchMacAutoChest, patchMacAutoChestNames } from './patch-frontend.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const profile = getRegionProfile();
@@ -18,7 +18,7 @@ const original = files.get(entry);
 if (!original?.includes(`const APP_REGION="${profile.region}"`)) throw new Error(`Expected official ${profile.region} frontend.`);
 let main = patchMacUpdater(original);
 main = profile.region === 'CN' ? patchDomesticSdkUrls(main) : patchGlobalAuthListener(main);
-files.set(entry, patchSessionBarriers(main));
+files.set(entry, patchMacAutoChestNames(patchSessionBarriers(main)));
 
 function patchOne(description, matches, patch) {
   const selected = [...files].filter(([name, content]) => matches(name, content));
@@ -31,6 +31,7 @@ patchOne('modal event bridge', name => /\/modalBridge-[^/]+\.js$/.test(name), pa
 patchOne('update feedback view', (_, content) => /\.value=n\("setting_version_check_failed"\)/.test(content), patchMacUpdateFeedback);
 patchOne('About view', (_, content) => /t=[$\w]+\(\(\)=>k\("about_content"\)/.test(content), content => patchMacAbout(content, profile.region));
 patchOne('main layout view', (_, content) => content.includes('[main] window layout during open failed'), patchMacLayoutBarriers);
+patchOne('chest view', (_, content) => content.includes('"[chest] openChest failed"'), patchMacAutoChest);
 if (profile.region === 'CN') patchOne('domestic SDK loader', (name, content) => name !== entry && content.includes('t.dataset.kuroSdkRetry="true"'), patchDomesticLoginReload);
 
 await rm(output, { recursive: true, force: true });
