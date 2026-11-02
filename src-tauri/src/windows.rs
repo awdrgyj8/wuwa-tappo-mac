@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex, RwLock,
     },
     time::Duration,
@@ -16,6 +16,11 @@ use tauri::{
     AppHandle, Emitter, Listener, LogicalPosition, LogicalSize, Manager, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder,
 };
+
+/// Closed secondary windows keep a whole WebView process alive while hidden. These ones
+/// rebuild cleanly from their route, so they are destroyed after staying closed for a while.
+const RELEASABLE_WINDOWS: &[&str] = &["panel", "about", "oss-notice", "update"];
+const RELEASE_CLOSED_WINDOW_AFTER: Duration = Duration::from_secs(60);
 
 pub const COMMANDS: &[&str] = &[
     "apply_main_window_position",
@@ -72,9 +77,11 @@ pub struct WindowState {
     auxiliary: RwLock<BTreeMap<String, HitRegion>>,
     main_geometry: RwLock<MainGeometry>,
     stop: AtomicBool,
+    closed: Mutex<BTreeMap<String, u64>>,
+    close_generation: AtomicU64,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct MainGeometry {
     left: f64,
     top: f64,
@@ -88,6 +95,24 @@ struct HitState {
     window_passthrough: bool,
     force_ignore: bool,
     swallow: bool,
+}
+
+impl HitState {
+    /// Whether a cursor at main-window logical coordinates should click through the pet window.
+    fn ignores_cursor(&self, x: f64, y: f64) -> bool {
+        if self.swallow {
+            return false;
+        }
+        if self.force_ignore {
+            return true;
+        }
+        let regions = if self.window_passthrough {
+            &self.input_regions
+        } else {
+            &self.regions
+        };
+        !regions.iter().any(|r| r.contains(x, y))
+    }
 }
 
 #[derive(Deserialize)]
@@ -113,9 +138,15 @@ fn main_window(app: &AppHandle) -> Result<WebviewWindow, String> {
 
 fn initialize(app: &AppHandle, label: &str) -> Result<String, String> {
     let script = app.state::<SessionStore>().initialization_script()?;
+    let preferences = app
+        .try_state::<crate::preferences::PreferenceStore>()
+        .map(|store| store.initialization_script())
+        .unwrap_or_default();
+    // Preferences wrap Storage before the session bridge captures its methods.
     let mut initialization = format!(
-        "{}\n{script}\n{}\n{}\n{}",
+        "{}\n{preferences}\n{}\n{script}\n{}\n{}\n{}",
         crate::profile::Region::from_app(app).initialization_script(),
+        include_str!("../../scripts/mac-preferences.js"),
         include_str!("../../scripts/mac-websocket.js"),
         include_str!("../../scripts/mac-platform.js"),
         include_str!("../../scripts/mac-auto-chest.js")
@@ -229,6 +260,7 @@ fn build_window(
                     if let Err(error) = w.hide() {
                         eprintln!("Could not hide {label}: {error}");
                     }
+                    schedule_release(&app, &label);
                 }
                 if label == "panel" {
                     if let Err(error) = app.emit("cat-panel-window-closed", ()) {
@@ -252,6 +284,11 @@ fn show_aux(
     route: &str,
     size: (f64, f64),
 ) -> Result<(WebviewWindow, bool), String> {
+    app.state::<WindowState>()
+        .closed
+        .lock()
+        .map_err(err)?
+        .remove(label);
     let existing = app.get_webview_window(label);
     let existed = existing.is_some();
     let window = match existing {
@@ -343,6 +380,54 @@ fn number(args: &Value, name: &str) -> Result<f64, String> {
         .ok_or_else(|| format!("Invalid {name}"))
 }
 
+fn schedule_release(app: &AppHandle, label: &str) {
+    if !RELEASABLE_WINDOWS.contains(&label) {
+        return;
+    }
+    let state = app.state::<WindowState>();
+    let generation = state.close_generation.fetch_add(1, Ordering::AcqRel) + 1;
+    match state.closed.lock() {
+        Ok(mut closed) => closed.insert(label.to_string(), generation),
+        Err(_) => return,
+    };
+    let app = app.clone();
+    let label = label.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(RELEASE_CLOSED_WINDOW_AFTER);
+        let handle = app.clone();
+        if let Err(error) = app.run_on_main_thread(move || release(&handle, &label, generation)) {
+            eprintln!("Could not schedule closed window release: {error}");
+        }
+    });
+}
+
+fn release(app: &AppHandle, label: &str, generation: u64) {
+    let state = app.state::<WindowState>();
+    let Ok(mut closed) = state.closed.lock() else {
+        return;
+    };
+    if closed.get(label) != Some(&generation) {
+        return;
+    }
+    closed.remove(label);
+    drop(closed);
+    let Some(window) = app.get_webview_window(label) else {
+        return;
+    };
+    if window.is_visible().unwrap_or(true) {
+        return;
+    }
+    if label == "panel" {
+        // A rebuilt panel starts at its expanded default size.
+        if let Ok(mut collapsed) = state.panel_collapsed.lock() {
+            *collapsed = false;
+        }
+    }
+    if let Err(error) = window.destroy() {
+        eprintln!("Could not release closed {label} window: {error}");
+    }
+}
+
 fn close(app: &AppHandle, label: &str) -> Result<Value, String> {
     app.state::<WindowState>()
         .auxiliary
@@ -351,6 +436,7 @@ fn close(app: &AppHandle, label: &str) -> Result<Value, String> {
         .remove(label);
     if let Some(w) = app.get_webview_window(label) {
         w.hide().map_err(err)?;
+        schedule_release(app, label);
     }
     if label == "panel" {
         app.emit("cat-panel-window-closed", ()).map_err(err)?;
@@ -728,52 +814,39 @@ pub fn setup(app: &AppHandle) -> Result<(), String> {
             eprintln!("Could not schedule input access request: {error}");
         }
     });
+    // Poll the cursor without main-thread round trips: CoreGraphics reports it in the same
+    // global top-left points as the cached main-window geometry. The main thread is only
+    // touched when the pass-through state actually changes.
     std::thread::spawn({
         let app = app.clone();
         move || {
             let mut previous = None;
             loop {
-                if app.state::<WindowState>().stop.load(Ordering::Acquire) {
+                let state = app.state::<WindowState>();
+                if state.stop.load(Ordering::Acquire) {
                     break;
                 }
-                if let Some(w) = app.get_webview_window("main") {
-                    let result = (|| -> Result<(), String> {
-                        let scale = w.scale_factor().map_err(err)?;
-                        let origin = w.inner_position().map_err(err)?;
-                        let cursor = w.cursor_position().map_err(err)?;
-                        let primary_scale = w
-                            .primary_monitor()
-                            .map_err(err)?
-                            .ok_or("No primary display")?
-                            .scale_factor();
-                        let x = cursor.x / primary_scale - origin.x as f64 / scale;
-                        let y = cursor.y / primary_scale - origin.y as f64 / scale;
-                        let state = app.state::<WindowState>();
-                        let h = state.hit.read().map_err(err)?;
-                        let ignored = if h.swallow {
-                            false
-                        } else if h.force_ignore {
-                            true
-                        } else {
-                            let regions = if h.window_passthrough {
-                                &h.input_regions
-                            } else {
-                                &h.regions
-                            };
-                            !regions.iter().any(|r| r.contains(x, y))
-                        };
-                        drop(h);
-                        if previous != Some(ignored) {
-                            w.set_ignore_cursor_events(ignored).map_err(err)?;
-                            previous = Some(ignored);
-                        }
-                        Ok(())
-                    })();
-                    if let Err(error) = result {
-                        eprintln!("Hit region update stopped: {error}");
-                        break;
+                let Some(w) = app.get_webview_window("main") else {
+                    break;
+                };
+                let result = (|| -> Result<(), String> {
+                    let Some((cursor_x, cursor_y)) = crate::input::cursor_location() else {
+                        return Ok(());
+                    };
+                    let geometry = *state.main_geometry.read().map_err(err)?;
+                    let ignored = state
+                        .hit
+                        .read()
+                        .map_err(err)?
+                        .ignores_cursor(cursor_x - geometry.left, cursor_y - geometry.top);
+                    if previous != Some(ignored) {
+                        w.set_ignore_cursor_events(ignored).map_err(err)?;
+                        previous = Some(ignored);
                     }
-                } else {
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    eprintln!("Hit region update stopped: {error}");
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(16));
@@ -781,4 +854,53 @@ pub fn setup(app: &AppHandle) -> Result<(), String> {
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn region(left: f64, top: f64) -> HitRegion {
+        HitRegion {
+            left,
+            top,
+            width: 100.,
+            height: 50.,
+            member_id: None,
+        }
+    }
+
+    #[test]
+    fn pet_regions_capture_the_cursor_and_the_rest_clicks_through() {
+        let hit = HitState {
+            regions: vec![region(10., 20.)],
+            input_regions: vec![region(500., 500.)],
+            ..HitState::default()
+        };
+        assert!(!hit.ignores_cursor(10., 20.));
+        assert!(!hit.ignores_cursor(109.9, 69.9));
+        assert!(hit.ignores_cursor(110., 20.));
+        assert!(hit.ignores_cursor(520., 520.));
+        let passthrough = HitState {
+            window_passthrough: true,
+            ..hit
+        };
+        assert!(passthrough.ignores_cursor(50., 40.));
+        assert!(!passthrough.ignores_cursor(520., 520.));
+    }
+
+    #[test]
+    fn swallow_and_forced_ignore_override_regions() {
+        let forced = HitState {
+            regions: vec![region(0., 0.)],
+            force_ignore: true,
+            ..HitState::default()
+        };
+        assert!(forced.ignores_cursor(5., 5.));
+        let swallow = HitState {
+            swallow: true,
+            ..forced
+        };
+        assert!(!swallow.ignores_cursor(5000., 5000.));
+    }
 }

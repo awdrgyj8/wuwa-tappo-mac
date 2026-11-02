@@ -3,6 +3,7 @@ mod gamepad;
 mod geometry;
 mod input;
 mod menu;
+mod preferences;
 mod profile;
 mod session;
 mod socket;
@@ -231,6 +232,7 @@ fn handle(invoke: Invoke) -> bool {
         storage::save_key_press_count,
         storage::load_cumulative_click_count,
         storage::save_cumulative_click_count,
+        preferences::save_preference,
         input::get_input_status,
         input::request_input_access,
         input::resume_input_monitor,
@@ -275,6 +277,9 @@ pub fn run() {
             let handle = app.handle().clone();
             app.manage(storage::CounterStore::new(
                 app.path().app_data_dir()?.join("counters.json"),
+            ));
+            app.manage(preferences::PreferenceStore::open(
+                app.path().app_config_dir()?.join("preferences.json"),
             ));
             menu::setup(&handle)?;
             app.manage(system::start_network_monitor(handle.clone())?);

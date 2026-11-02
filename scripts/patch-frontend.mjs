@@ -200,6 +200,54 @@ export function patchMacAutoChest(source) {
   return source.slice(0, reward) + claimed + source.slice(reward, node.end) + attach + source.slice(node.end);
 }
 
+// The official emote menu keeps a requestAnimationFrame spring loop alive for the whole
+// session, waking the always-visible pet window every frame. Run it only while a button
+// is pressed or still settling, and wake it again on the next press.
+export function patchMacEmotionMenuIdle(source) {
+  const changed = 'Original emote menu animation changed; reconcile the Mac idle frame patch before building.';
+  const tree = parse(source, { sourceType: 'module', ecmaVersion: 'latest' });
+  const components = [];
+  walkSyntax(tree, node => {
+    if (node.type === 'ObjectExpression' && node.properties.some(item => item.type === 'Property' && !item.computed
+      && (item.key.name ?? item.key.value) === '__name' && item.value.type === 'Literal' && item.value.value === 'EmotionMenu')) components.push(node);
+  });
+  if (components.length !== 1) throw new Error(changed);
+  const [component] = components;
+  const componentText = source.slice(component.start, component.end);
+  if (!['targetX:1,targetY:1,targetR:0', 'held:!1,releaseTimer:0,returnTimer:0'].every(fields => componentText.includes(fields))) throw new Error(changed);
+  const loops = [], presses = [];
+  walkSyntax(component, node => {
+    if (node.type !== 'FunctionDeclaration') return;
+    const tail = node.body.body.at(-1);
+    const frame = tail?.type === 'ExpressionStatement' ? tail.expression : null;
+    if (frame?.type === 'AssignmentExpression' && frame.operator === '=' && frame.left.type === 'Identifier'
+      && frame.right.type === 'CallExpression' && frame.right.callee.type === 'Identifier' && frame.right.callee.name === 'requestAnimationFrame'
+      && frame.right.arguments.length === 1 && frame.right.arguments[0].type === 'Identifier' && frame.right.arguments[0].name === node.id.name) {
+      loops.push({ node, frame, handle: frame.left.name });
+    }
+    if (source.slice(node.start, node.end).includes('.pressedAt=performance.now()')) presses.push(node);
+  });
+  if (loops.length !== 1 || presses.length !== 1) throw new Error(changed);
+  const [{ node: loop, frame, handle }] = loops;
+  const header = /^function [$\w]+\(([$\w]+)\)\{const [$\w]+=Math\.min\(\(\1-([$\w]+)\)\/1e3,\.028\);\2=\1;for\(const\[[$\w]+,[$\w]+\]of ([$\w]+)\)/.exec(source.slice(loop.start, loop.end));
+  if (!header) throw new Error(changed);
+  const [, , clock, states] = header;
+  const schedule = `${handle}=requestAnimationFrame(${loop.id.name})`;
+  const start = `${clock}=performance.now(),${schedule}`;
+  if (componentText.split(schedule).length !== 3 || componentText.split(start).length !== 2) throw new Error(changed);
+  const press = presses[0].body.body.at(-1);
+  if (press?.type !== 'ExpressionStatement' || !source.slice(press.start, press.end).includes('.held=!0')) throw new Error(changed);
+  const mount = component.start + componentText.indexOf(start);
+  const edits = [
+    [frame.start, frame.end, `${handle}=__wuwatappoSpringActive(${states})?requestAnimationFrame(${loop.id.name}):0`],
+    [mount, mount + start.length, `${clock}=performance.now(),${handle}=0`],
+    [press.expression.end, press.expression.end, `,${handle}||(${start})`],
+  ].sort((first, second) => second[0] - first[0]);
+  for (const [from, to, text] of edits) source = source.slice(0, from) + text + source.slice(to);
+  const helper = 'function __wuwatappoSpringActive(states){for(const state of states.values())if(state.held||state.releaseTimer||state.returnTimer||Math.abs(state.x-state.targetX)>.001||Math.abs(state.y-state.targetY)>.001||Math.abs(state.r-state.targetR)>.001||Math.abs(state.vx)>.01||Math.abs(state.vy)>.01||Math.abs(state.vr)>.01)return!0;return!1}\n';
+  return helper + source;
+}
+
 export function patchMacAutoChestNames(source) {
   const tree = parse(source, { sourceType: 'module', ecmaVersion: 'latest' });
   if (tree.body.filter(node => node.type === 'FunctionDeclaration' && node.id.name === 'resolveAssetDisplayName').length !== 1) {

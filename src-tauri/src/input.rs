@@ -7,6 +7,7 @@ use std::{
         mpsc, Arc, Mutex,
     },
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -663,13 +664,88 @@ fn route_event(
     }
 }
 
+/// The pet view hit-tests the DOM for every global mouse move; one per display frame is
+/// enough, while high-polling-rate mice can report up to 1000 moves a second.
+const MOVE_EMIT_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Coalesces mouse moves so at most one is delivered per interval. The newest position
+/// always wins and is delivered no later than one interval after the previous one.
+struct MoveThrottle<T> {
+    pending: Option<T>,
+    last: Option<Instant>,
+}
+
+impl<T> MoveThrottle<T> {
+    fn new() -> Self {
+        Self {
+            pending: None,
+            last: None,
+        }
+    }
+
+    fn offer(&mut self, now: Instant, position: T) -> Option<T> {
+        let ready = self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) >= MOVE_EMIT_INTERVAL);
+        if self.pending.is_none() && ready {
+            self.last = Some(now);
+            return Some(position);
+        }
+        self.pending = Some(position);
+        None
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.pending.as_ref()?;
+        self.last.map(|last| last + MOVE_EMIT_INTERVAL)
+    }
+
+    fn take_due(&mut self, now: Instant) -> Option<T> {
+        if self.deadline().is_some_and(|deadline| now >= deadline) {
+            self.last = Some(now);
+            return self.pending.take();
+        }
+        None
+    }
+
+    /// A button event carries a newer position of its own.
+    fn supersede(&mut self, now: Instant) {
+        self.pending = None;
+        self.last = Some(now);
+    }
+}
+
 fn dispatch_events(
     app: AppHandle,
     state: Arc<MonitorState>,
     receiver: mpsc::Receiver<NativeInput>,
 ) {
     let mut routing = MouseRouting::default();
-    for event in receiver {
+    let mut moves = MoveThrottle::new();
+    loop {
+        let received = match moves.deadline() {
+            Some(deadline) => {
+                match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(event) => Some(event),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            None => match receiver.recv() {
+                Ok(event) => Some(event),
+                Err(_) => break,
+            },
+        };
+        let Some(event) = received else {
+            if let Some(position) = moves.take_due(Instant::now()) {
+                if let Err(error) = app.emit("mouse-move", position) {
+                    state.error(format!("input_event_delivery_failed: {error}"));
+                    state.wake_and_stop();
+                    break;
+                }
+            }
+            continue;
+        };
         let event = match route_event(event, &mut routing, &state) {
             Ok(Some(event)) => event,
             Ok(None) => continue,
@@ -683,8 +759,12 @@ fn dispatch_events(
             RoutedInput::Key { key, pressed } => {
                 app.emit(if pressed { "key-press" } else { "key-release" }, key)
             }
-            RoutedInput::Move(position) => app.emit("mouse-move", position),
+            RoutedInput::Move(position) => match moves.offer(Instant::now(), position) {
+                Some(position) => app.emit("mouse-move", position),
+                None => Ok(()),
+            },
             RoutedInput::Button { position, button } => {
+                moves.supersede(Instant::now());
                 // Keep global cursor state current before the main-owned button event.
                 app.emit("mouse-move", position)
                     .and_then(|_| app.emit("mouse-button", button))
@@ -696,6 +776,18 @@ fn dispatch_events(
             break;
         }
     }
+}
+
+/// Current cursor in global top-left points (the coordinate space of tao's cursor
+/// position divided by the primary scale). Safe off the main thread.
+pub fn cursor_location() -> Option<(f64, f64)> {
+    let event = unsafe { CGEventCreate(std::ptr::null_mut()) };
+    if event.is_null() {
+        return None;
+    }
+    let point = unsafe { CGEventGetLocation(event) };
+    unsafe { CFRelease(event) };
+    (point.x.is_finite() && point.y.is_finite()).then_some((point.x, point.y))
 }
 
 fn physical_mouse_point(point: Point, state: &MonitorState) -> Point {
@@ -875,6 +967,7 @@ unsafe extern "C" {
     fn CGEventTapIsEnabled(tap: *mut c_void) -> bool;
     fn CGEventGetIntegerValueField(event: *mut c_void, field: u32) -> i64;
     fn CGEventGetLocation(event: *mut c_void) -> Point;
+    fn CGEventCreate(source: *mut c_void) -> *mut c_void;
     fn CGEventSourceKeyState(state: i32, key: u16) -> bool;
     #[cfg(test)]
     fn CGEventCreateKeyboardEvent(source: *mut c_void, key: u16, down: bool) -> *mut c_void;
@@ -910,6 +1003,38 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_moves_are_limited_to_one_per_frame_with_the_newest_position() {
+        let start = Instant::now();
+        let ms = |value: u64| start + Duration::from_millis(value);
+        let mut moves = MoveThrottle::new();
+        assert_eq!(moves.offer(ms(0), 1), Some(1));
+        assert_eq!(moves.deadline(), None);
+        assert_eq!(moves.offer(ms(1), 2), None);
+        assert_eq!(moves.offer(ms(5), 3), None);
+        assert_eq!(moves.deadline(), Some(ms(16)));
+        assert_eq!(moves.take_due(ms(15)), None);
+        assert_eq!(moves.take_due(ms(16)), Some(3));
+        assert_eq!(moves.deadline(), None);
+        assert_eq!(moves.offer(ms(20), 4), None, "still within one frame of the last move");
+        assert_eq!(moves.offer(ms(40), 5), None, "a pending move keeps its deadline");
+        assert_eq!(moves.take_due(ms(40)), Some(5));
+        assert_eq!(moves.offer(ms(100), 6), Some(6), "an idle cursor is delivered at once");
+    }
+
+    #[test]
+    fn button_positions_replace_pending_moves() {
+        let start = Instant::now();
+        let mut moves = MoveThrottle::new();
+        assert_eq!(moves.offer(start, 1), Some(1));
+        assert_eq!(moves.offer(start + Duration::from_millis(2), 2), None);
+        moves.supersede(start + Duration::from_millis(3));
+        assert_eq!(moves.deadline(), None);
+        assert_eq!(moves.take_due(start + Duration::from_secs(1)), None);
+        assert_eq!(moves.offer(start + Duration::from_millis(10), 3), None);
+        assert_eq!(moves.take_due(start + Duration::from_millis(19)), Some(3));
+    }
 
     struct TestEvent(*mut c_void);
     impl Drop for TestEvent {
