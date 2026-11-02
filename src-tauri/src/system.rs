@@ -772,11 +772,13 @@ mod tests {
     fn windows_update_never_becomes_a_mac_update() {
         let manifest = json!({ "version": "1.0.0", "platforms": { "windows-x86_64": { "url": "https://wutheringwaves-wuwatappo.kurogames-global.com/setup.exe", "signature": "signature" } } });
         let error = mac_update_status(&manifest, "darwin-aarch64", Region::Global).unwrap_err();
+        assert!(error.contains("沒有適用於此 Mac"));
+        let error = mac_update_status(&manifest, "darwin-aarch64", Region::Cn).unwrap_err();
         assert!(error.contains("没有适用于此 Mac"));
         let disguised = json!({ "platforms": { "darwin-aarch64": { "url": "https://wutheringwaves-wuwatappo.kurogames-global.com/setup.exe", "signature": "signature" } } });
         assert!(mac_update_status(&disguised, "darwin-aarch64", Region::Global)
             .unwrap_err()
-            .contains("Windows 安装包"));
+            .contains("Windows 安裝檔"));
     }
 
     #[test]
@@ -785,7 +787,7 @@ mod tests {
         let unsigned = json!({ "platforms": { "darwin-aarch64": { "url": "https://wutheringwaves-wuwatappo.kurogames-global.com/mac.tar.gz" } } });
         assert!(mac_update_status(&unsigned, "darwin-aarch64", Region::Global)
             .unwrap_err()
-            .contains("缺少签名"));
+            .contains("缺少簽章"));
     }
 
     #[test]
