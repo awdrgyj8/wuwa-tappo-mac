@@ -67,20 +67,27 @@ test('Global auto chest menu text uses Traditional Chinese', async () => {
   const menus = [];
   const window = {
     __WUWATAPPO_PROFILE__: { region: 'GLOBAL' },
-    localStorage: { getItem: () => null, setItem() {} },
+    localStorage: (() => { const values = new Map(); return { getItem: key => values.get(key) ?? null, setItem: (key, value) => values.set(key, value) }; })(),
     setTimeout() { return 1; }, setInterval() { return 1; }, addEventListener() {},
     __TAURI__: { core: { invoke: async (command, payload) => { if (command === 'sync_auto_chest_menu') menus.push(JSON.parse(JSON.stringify(payload))); } }, event: { listen: async () => {} } },
   };
   vm.runInNewContext(autoChest, { window, Date, console: { warn() {} } });
   const chest = window.__WUWATAPPO_AUTO_CHEST__;
   const state = { loggedIn: false, account: '1', locked: false, busy: false, disabled: false, left: true, right: false, clicks: 1000, minimum: 1000 };
-  chest.attach({ snapshot: () => ({ ...state }), open: async place => chest.claimed(place, { rarity_type: 'uncommon' }, 'accessory', 'accessory_9') });
+  chest.attach({ snapshot: () => ({ ...state }), open: async place => { chest.claimed(place, { rarity_type: 'uncommon' }, 'accessory', 'accessory_9'); state[place] = false; } });
   await chest.check();
   assert.equal(menus.at(-1).summary, '登入後才會自動領取寶箱');
   state.loggedIn = true;
   await chest.check();
-  assert.equal(menus.at(-1).summary, '已自動領取 1 件，最近獲得：');
+  assert.equal(menus.at(-1).summary, '冷卻中，結束後自動領取 · 已領 1 件');
   assert.match(menus.at(-1).entries[0], /accessory_9（飾品·藍）$/);
+  Object.assign(state, { rightWait: 5 * 60_000 });
+  await chest.check();
+  assert.match(menus.at(-1).summary, /^冷卻中，\d\d:\d\d 自動領取 · 已領 1 件$/);
+  Object.assign(state, { right: true, rightWait: 0, clicks: 10 });
+  await chest.check();
+  assert.equal(menus.at(-1).summary, '點擊數不足 1000，累積後自動領取 · 已領 1 件');
+  for (const summary of menus.map(menu => menu.summary)) assert.doesNotMatch(summary, simplified);
 });
 
 test('Global session error banner uses Traditional Chinese', async () => {

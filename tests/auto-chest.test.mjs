@@ -12,7 +12,7 @@ const script = await readFile(new URL('../scripts/mac-auto-chest.js', import.met
 
 // Same statement shapes as the official 1.0.2 pet view, with minified local names.
 const handler = 'async function uc(e){if(Ie()){yt($("update_force_lock_hint"));return}if(Dn.value||kt.value)return;const t=e==="left"?xi:Di,o=e==="left"?Oi:Fi;if(!(e==="left"?Wn.value:Gn.value))return;if(!A.isLoggedIn){ru(),q();return}Dn.value=!0;let b=!1;try{if(b=!0,A.totalClickCount<Ns){yt("click_not_enough");return}const M=await(async()=>{const Z=await km({place:e,click_num:A.cumulativeClickCount});return{ok:!0,data:Z,assetName:String(Z.asset_name),assetType:String(Z.asset_type)}})();if(!M.ok)return;Cm({itemId:M.data.asset_id,itemRarity:M.data.rarity_type,itemType:M.assetType}),await Rp(M.assetType,M.assetName)}catch(M){console.warn("[chest] openChest failed",M)}finally{Dn.value=!1}}';
-const fixture = `const A={isLoggedIn:!0,userInfo:{id:42},totalClickCount:1500,cumulativeClickCount:9000},Ns=1e3;let lockedState=!1;function Ie(){return lockedState}function setup(){const Dn={value:!1},kt={value:!1},Wn={value:!0},Gn={value:!1},xi=0,Di=0,Oi=0,Fi=0;${handler}function Yn(){}return{uc,Dn,kt,Wn,Gn}}`;
+const fixture = `const A={isLoggedIn:!0,userInfo:{id:42},totalClickCount:1500,cumulativeClickCount:9000},Ns=1e3;let lockedState=!1;function Ie(){return lockedState}function setup(){const Dn={value:!1},kt={value:!1},Bt={value:0},Nt={value:9e4};const Wn=pe(()=>kt.value||!A.isLoggedIn?!0:Bt.value<=0),Gn=pe(()=>kt.value||!A.isLoggedIn?!0:Nt.value<=0),xi=0,Di=0,Oi=0,Fi=0;${handler}function Yn(){}return{uc,Dn,kt,Bt,Nt}}`;
 
 function runPatchedView(source) {
   const calls = [];
@@ -23,6 +23,7 @@ function runPatchedView(source) {
   const env = vm.createContext({
     window: { __WUWATAPPO_AUTO_CHEST__: controller },
     $: key => key, yt: message => calls.push(['toast', message]), ru() {}, q() {},
+    pe: compute => ({ get value() { return compute(); } }),
     km: async request => { calls.push(['request', request]); return { asset_id: 7, asset_name: 'accessory_1000', asset_type: 'accessory', rarity_type: 'rare' }; },
     Cm: item => calls.push(['track', item.itemId]),
     Rp: async () => calls.push(['popup']),
@@ -41,9 +42,9 @@ test('auto chest patch exposes the official handler and records rewards before t
   assert.equal(target.open, env.view.uc);
   assert.deepEqual({ ...target.snapshot() }, {
     loggedIn: true, account: '42', locked: false, busy: false, disabled: false,
-    left: true, right: false, clicks: 1500, minimum: 1000,
+    left: true, right: false, leftWait: 0, rightWait: 90000, clicks: 1500, minimum: 1000,
   });
-  env.view.Dn.value = true; env.view.Gn.value = true; env.setLocked(true);
+  env.view.Dn.value = true; env.view.Nt.value = 0; env.setLocked(true);
   assert.deepEqual([target.snapshot().busy, target.snapshot().right, target.snapshot().locked], [true, true, true]);
   env.view.Dn.value = false; env.setLocked(false);
   await target.open('left');
@@ -60,7 +61,8 @@ test('auto chest patch stops the build when the official chest flow changes', ()
   assert.throws(() => patchMacAutoChest(fixture.replace('itemType:M.assetType', 'itemKind:M.assetType')), changed);
   assert.throws(() => patchMacAutoChest(fixture.replace('"update_force_lock_hint"', '"update_lock"')), changed);
   assert.throws(() => patchMacAutoChest(fixture.replace('A.totalClickCount<Ns', 'A.totalClickCount<1e3')), changed);
-  assert.throws(() => patchMacAutoChest(fixture.replace('Gn={value:!1},', '')), changed, 'chest state must be in the handler scope');
+  assert.throws(() => patchMacAutoChest(fixture.replace('Nt={value:9e4}', 'Nx={value:9e4}')), changed, 'chest state must be in the handler scope');
+  assert.throws(() => patchMacAutoChest(fixture.replace('?!0:Bt.value<=0', '?!0:Bt.value<1')), changed, 'cooldown refs must be found');
   assert.throws(() => patchMacAutoChest(fixture.replace(handler, handler + handler.replace('uc(', 'uc2('))), changed);
   assert.throws(() => patchMacAutoChestNames('function other(){}'), /reward name resolver changed/);
   assert.match(patchMacAutoChestNames('function resolveAssetDisplayName(e,t){return t}export{resolveAssetDisplayName as co};'), /useAssetNames\(resolveAssetDisplayName\)/);
@@ -122,25 +124,37 @@ function webview({ stored } = {}) {
   };
 }
 
-test('auto chest waits for login, enough clicks and a finished cooldown before opening', async () => {
+test('the menu explains why nothing is opened yet, and the log records it', async () => {
   const app = webview();
   app.controller.attach(app.view);
   assert.equal(typeof app.interval, 'function');
   assert.deepEqual(app.timeouts.map(item => item.delay), [3000]);
+  const summary = async () => { assert.equal(await app.controller.check(), false); return app.menus().at(-1).summary; };
   app.state.loggedIn = false;
   assert.equal(await app.controller.check(), false);
   assert.deepEqual(app.menus().at(-1), { enabled: true, summary: '登录后才会自动领取宝箱', entries: [] });
-  app.state.loggedIn = true; app.state.left = true; app.state.clicks = 999;
+  Object.assign(app.state, { loggedIn: true, leftWait: 25 * 60_000, rightWait: 12 * 60_000 });
+  assert.equal(await summary(), '冷却中，06:42 后自动领取');
+  Object.assign(app.state, { left: true, leftWait: 0, clicks: 999 });
+  assert.equal(await summary(), '点击数不足 1000，累积后自动领取');
+  Object.assign(app.state, { clicks: 1000, disabled: true });
+  assert.equal(await summary(), '宝箱同步中，完成后自动领取');
+  Object.assign(app.state, { disabled: false, locked: true });
+  assert.equal(await summary(), '需要先更新应用');
+  const synced = app.menus().length;
+  Object.assign(app.state, { locked: false, busy: true });
   assert.equal(await app.controller.check(), false);
-  assert.equal(app.menus().at(-1).summary, '暂无领取记录，冷却结束后自动领取');
-  for (const blocker of ['locked', 'busy', 'disabled']) {
-    app.state.clicks = 1000; app.state[blocker] = true;
-    assert.equal(await app.controller.check(), false, blocker);
-    app.state[blocker] = false;
-  }
-  app.state.left = false;
+  assert.equal(app.menus().length, synced, 'a busy official handler keeps the previous status');
+  app.state.busy = false; app.state.left = false;
   assert.equal(await app.controller.check(), false);
   assert.deepEqual(app.opened, []);
+  app.advance(10 * 60_000);
+  await app.controller.check();
+  const logs = app.invokes.filter(call => call.command === 'write_app_log').map(call => call.payload.message);
+  for (const line of ['[CHEST] status=logged_out', '[CHEST] status=cooldown next=06:42', '[CHEST] status=clicks clicks=999', '[CHEST] status=syncing', '[CHEST] status=update_locked']) {
+    assert.ok(logs.includes(line), line);
+  }
+  assert.equal(logs.filter(line => line.startsWith('[CHEST] alive status=')).length, 2, 'a heartbeat every ten minutes');
 });
 
 test('auto chest opens each ready chest and lists rewards for the main menu', async () => {
@@ -156,14 +170,16 @@ test('auto chest opens each ready chest and lists rewards for the main menu', as
   assert.deepEqual(app.opened, ['left', 'right']);
   assert.deepEqual(app.menus().at(-1), {
     enabled: true,
-    summary: '已自动领取 2 件，最近获得：',
+    summary: '冷却中，结束后自动领取 · 已领 2 件',
     entries: ['11/02 06:31  accessory_1000（饰品·紫）', '11/02 06:30  今汐·夏日（角色·金）'],
   });
   assert.deepEqual(app.stored().records.map(record => [record.place, record.account, record.type, record.name, record.rarity]), [
     ['right', '42', 'accessory', 'accessory_1000', 'rare'],
     ['left', '42', 'character_skin', 'role_1102_3', 'epic'],
   ]);
-  assert.ok(app.invokes.some(call => call.command === 'write_app_log' && call.payload.message === '[CHEST] auto_claim place=left result=ok'));
+  const logs = app.invokes.filter(call => call.command === 'write_app_log').map(call => call.payload.message);
+  assert.ok(logs.includes('[CHEST] auto_claim start place=left'));
+  assert.ok(logs.includes('[CHEST] auto_claim place=left result=ok ms=0'));
   app.controller.claimed('left', { rarity_type: 'epic' }, 'emote', 'emote_1_happy');
   assert.equal(app.stored().records.length, 2, 'manual openings are not reported as automatic rewards');
 });
@@ -197,19 +213,20 @@ test('menu actions pause automatic opening and clear only the current account re
   Object.assign(app.state, { right: true, clicks: 1000 });
   app.setReward({ type: 'accessory', name: 'accessory_1000', rarity: 'uncommon' });
   assert.equal(await app.controller.check(), true);
-  assert.equal(app.menus().at(-1).summary, '已自动领取 1 件，最近获得：', 'other account records stay hidden');
+  assert.equal(app.menus().at(-1).summary, '冷却中，结束后自动领取 · 已领 1 件', 'other account records stay hidden');
   app.listeners.get('mac-auto-chest-toggle')();
   assert.equal(app.stored().enabled, false);
   assert.equal(app.menus().at(-1).enabled, false);
   app.state.right = true;
   assert.equal(await app.controller.check(), false);
   assert.deepEqual(app.opened, ['right']);
+  assert.equal(app.menus().at(-1).summary, '自动领取已暂停 · 已领 1 件');
   app.listeners.get('mac-auto-chest-clear')();
   assert.deepEqual(app.stored().records, [other]);
-  assert.deepEqual(app.menus().at(-1), { enabled: false, summary: '暂无领取记录', entries: [] });
+  assert.deepEqual(app.menus().at(-1), { enabled: false, summary: '自动领取已暂停', entries: [] });
   app.listeners.get('mac-auto-chest-toggle')();
   assert.equal(app.stored().enabled, true);
-  assert.deepEqual(app.timeouts.at(-1).delay, 0, 'enabling checks immediately');
+  assert.deepEqual(app.timeouts.at(-1).delay, 0, 'toggling re-checks immediately');
 });
 
 test('damaged records and failing name lookups fall back safely', async () => {

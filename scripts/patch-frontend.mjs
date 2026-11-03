@@ -214,13 +214,17 @@ export function patchMacAutoChest(source) {
   if (!minimum || (content.match(request) ?? []).length !== 1 || rewards.length !== 1) throw new Error(changed);
   const result = rewards[0][1];
   if (!content.includes(`${result}.assetName`)) throw new Error(changed);
+  // Remaining cooldown refs behind the official readiness computeds, e.g. Wn=pe(()=>kt.value||!A.isLoggedIn?!0:Bt.value<=0).
+  const wait = name => new RegExp(`[,;\\s]${escapeRegExp(name)}=[$\\w]+\\(\\(\\)=>${escapeRegExp(disabled)}\\.value\\|\\|!${s}\\.isLoggedIn\\?!0:([$\\w]+)\\.value<=0\\)`).exec(source.slice(block.start, block.end))?.[1];
+  const leftWait = wait(left), rightWait = wait(right);
+  if (!leftWait || !rightWait) throw new Error(changed);
   const local = declaredNames(block.body);
   const module = declaredNames(tree.body);
-  if (![busy, disabled, left, right].every(name => local.has(name))
+  if (![busy, disabled, left, right, leftWait, rightWait].every(name => local.has(name))
     || ![locked, store, minimum].every(name => module.has(name) && !local.has(name))) throw new Error(changed);
   const controller = 'window.__WUWATAPPO_AUTO_CHEST__';
   const claimed = `${controller}?.claimed(${place},${result}.data,${result}.assetType,${result}.assetName),`;
-  const attach = `${controller}?.attach({open:${handler},snapshot:()=>({loggedIn:!!${store}.isLoggedIn,account:String(${store}.userInfo?.id??""),locked:!!${locked}(),busy:!!${busy}.value,disabled:!!${disabled}.value,left:!!${left}.value,right:!!${right}.value,clicks:Number(${store}.totalClickCount)||0,minimum:${minimum}})});`;
+  const attach = `${controller}?.attach({open:${handler},snapshot:()=>({loggedIn:!!${store}.isLoggedIn,account:String(${store}.userInfo?.id??""),locked:!!${locked}(),busy:!!${busy}.value,disabled:!!${disabled}.value,left:!!${left}.value,right:!!${right}.value,leftWait:Number(${leftWait}.value)||0,rightWait:Number(${rightWait}.value)||0,clicks:Number(${store}.totalClickCount)||0,minimum:${minimum}})});`;
   const reward = node.start + rewards[0].index;
   return source.slice(0, reward) + claimed + source.slice(reward, node.end) + attach + source.slice(node.end);
 }

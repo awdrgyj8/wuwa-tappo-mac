@@ -8,6 +8,7 @@
   const RETRY_MAX_MS = 30 * 60_000;
   const MAX_RECORDS = 100;
   const MENU_ENTRIES = 5;
+  const ALIVE_LOG_MS = 10 * 60_000;
   const PLACES = ['left', 'right'];
   // Simplified Chinese for the CN app, Traditional Chinese for Global.
   const traditional = window.__WUWATAPPO_PROFILE__?.region === 'GLOBAL';
@@ -22,6 +23,8 @@
   let pending = null;
   let account;
   let listening = false;
+  let status = null;
+  let lastAlive = 0;
   const failures = { left: 0, right: 0 };
   const retryAt = { left: 0, right: 0 };
 
@@ -66,26 +69,53 @@
   }
 
   const pad = value => String(value).padStart(2, '0');
+  const clock = ms => { const date = new Date(ms); return `${pad(date.getHours())}:${pad(date.getMinutes())}`; };
   function formatRecord(record) {
     const date = new Date(record.at);
     const details = [TYPE_LABELS[record.type], RARITY_LABELS[record.rarity]].filter(Boolean).join('·');
     return `${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}  ${record.label}${details ? `（${details}）` : ''}`;
   }
 
+  // Why nothing is being opened right now, shown at the top of the menu.
+  function waitStatus(state, current, now) {
+    if (!state.enabled) return { key: 'paused', text: T('自动领取已暂停', '自動領取已暫停') };
+    if (!account) return { key: 'logged_out', text: T('登录后才会自动领取宝箱', '登入後才會自動領取寶箱') };
+    if (current.locked) return { key: 'update_locked', text: T('需要先更新应用', '需要先更新 App') };
+    if (current.busy) return null;
+    if (current.disabled) return { key: 'syncing', text: T('宝箱同步中，完成后自动领取', '寶箱同步中，完成後自動領取') };
+    const ready = PLACES.filter(place => current[place] === true);
+    if (!ready.length) {
+      const waits = PLACES.map(place => Number(current[`${place}Wait`])).filter(ms => Number.isFinite(ms) && ms > 0);
+      if (!waits.length) return { key: 'cooldown', text: T('冷却中，结束后自动领取', '冷卻中，結束後自動領取') };
+      const at = clock(now + Math.min(...waits));
+      return { key: 'cooldown', text: T(`冷却中，${at} 后自动领取`, `冷卻中，${at} 自動領取`), detail: `next=${at}` };
+    }
+    const minimum = Number(current.minimum);
+    if (!Number.isFinite(minimum) || !(Number(current.clicks) >= minimum)) {
+      return { key: 'clicks', text: T(`点击数不足 ${minimum}，累积后自动领取`, `點擊數不足 ${minimum}，累積後自動領取`), detail: `clicks=${Number(current.clicks) || 0}` };
+    }
+    if (!ready.some(place => now >= retryAt[place])) {
+      const at = clock(Math.min(...ready.map(place => retryAt[place])));
+      return { key: 'retry', text: T(`领取失败，${at} 重试`, `領取失敗，${at} 重試`), detail: `retry=${at}` };
+    }
+    return { key: 'ready', text: T('冷却结束，正在领取', '冷卻結束，正在領取') };
+  }
+
+  function updateStatus(next, state) {
+    if (!next || (status?.key === next.key && status.text === next.text)) return;
+    status = next;
+    log(`status=${next.key}${next.detail ? ` ${next.detail}` : ''}`);
+    syncMenu(state);
+  }
+
   function menuPayload(state) {
     if (!account) return { enabled: state.enabled, summary: T('登录后才会自动领取宝箱', '登入後才會自動領取寶箱'), entries: [] };
     const mine = state.records.filter(record => record.account === account);
-    if (!mine.length) {
-      return {
-        enabled: state.enabled,
-        summary: state.enabled ? T('暂无领取记录，冷却结束后自动领取', '尚無領取紀錄，冷卻結束後自動領取') : T('暂无领取记录', '尚無領取紀錄'),
-        entries: [],
-      };
-    }
     const total = mine.length >= MAX_RECORDS ? `${MAX_RECORDS}+` : String(mine.length);
+    const current = status?.text ?? (state.enabled ? T('冷却结束后自动领取', '冷卻結束後自動領取') : T('自动领取已暂停', '自動領取已暫停'));
     return {
       enabled: state.enabled,
-      summary: T(`已自动领取 ${total} 件，最近获得：`, `已自動領取 ${total} 件，最近獲得：`),
+      summary: mine.length ? `${current} · ${T(`已领 ${total} 件`, `已領 ${total} 件`)}` : current,
       entries: mine.slice(0, MENU_ENTRIES).map(formatRecord),
     };
   }
@@ -120,14 +150,20 @@
     if (!current) return false;
     refreshAccount(current);
     const state = load();
-    if (!state.enabled || !account || current.locked || current.busy || current.disabled) return false;
-    const minimum = Number(current.minimum);
-    if (!Number.isFinite(minimum) || !(Number(current.clicks) >= minimum)) return false;
     const now = Date.now();
+    const next = waitStatus(state, current, now);
+    updateStatus(next, state);
+    // Gaps between these lines in the log show when macOS paused the timers.
+    if (now - lastAlive >= ALIVE_LOG_MS) {
+      lastAlive = now;
+      log(`alive status=${status?.key ?? 'unknown'}`);
+    }
+    if (next?.key !== 'ready') return false;
     const place = PLACES.find(item => current[item] === true && now >= retryAt[item]);
     if (!place) return false;
     running = true;
     pending = { place, account, claimed: false };
+    log(`auto_claim start place=${place}`);
     try {
       await view.open(place);
     } catch {
@@ -137,6 +173,8 @@
     }
     const claimed = pending.claimed;
     pending = null;
+    const after = snapshot();
+    if (after) updateStatus(waitStatus(load(), after, Date.now()), load());
     if (claimed) {
       failures[place] = 0;
       retryAt[place] = 0;
@@ -144,7 +182,7 @@
       failures[place] += 1;
       retryAt[place] = Date.now() + Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** (failures[place] - 1));
     }
-    log(`auto_claim place=${place} result=${claimed ? 'ok' : 'failed'}`);
+    log(`auto_claim place=${place} result=${claimed ? 'ok' : 'failed'} ms=${Date.now() - now}`);
     return claimed;
   }
 
@@ -165,7 +203,7 @@
         save(state);
         log(`auto_claim enabled=${state.enabled}`);
         syncMenu(state);
-        if (state.enabled) schedule(0);
+        schedule(0);
       });
       await event.listen('mac-auto-chest-clear', () => {
         const state = load();
