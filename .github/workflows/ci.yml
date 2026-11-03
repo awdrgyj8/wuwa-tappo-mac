@@ -16,3 +16,6 @@ concurrency:
 jobs:
   build:
     uses: ./.github/workflows/build.yml
+    secrets:
+      MACOS_SIGNING_CERTIFICATE: ${{ secrets.MACOS_SIGNING_CERTIFICATE }}
+      MACOS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD }}

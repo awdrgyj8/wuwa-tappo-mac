@@ -8,6 +8,13 @@ on:
         required: false
         type: string
         default: ''
+    secrets:
+      # Optional stable signing certificate (base64 .p12 and its export password).
+      # Without them, builds keep the ad-hoc signature, e.g. for pull requests from forks.
+      MACOS_SIGNING_CERTIFICATE:
+        required: false
+      MACOS_SIGNING_CERTIFICATE_PASSWORD:
+        required: false
 
 permissions:
   contents: read
@@ -30,6 +37,7 @@ jobs:
       WUWA_INSTALLER_MIRROR_BASE: ${{ github.server_url }}/${{ github.repository }}/releases/download/upstream-resources
       MACOSX_DEPLOYMENT_TARGET: '13.0'
       CARGO_INCREMENTAL: '0'
+      MACOS_SIGNING_CONFIGURED: ${{ secrets.MACOS_SIGNING_CERTIFICATE != '' && secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD != '' }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -79,10 +87,19 @@ jobs:
           npm run test:rust
       - name: Build complete application
         run: npm run build -- -- --locked
+      - name: Import stable signing certificate
+        if: env.MACOS_SIGNING_CONFIGURED == 'true'
+        env:
+          MACOS_SIGNING_CERTIFICATE: ${{ secrets.MACOS_SIGNING_CERTIFICATE }}
+          MACOS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD }}
+        run: bash scripts/import-signing-certificate.sh
       - name: Verify and package ZIP and DMG
         run: |
           set -o pipefail
           npm run package 2>&1 | tee .work/package-macos.log
+      - name: Remove temporary signing keychain
+        if: always() && env.MACOS_SIGNING_KEYCHAIN != ''
+        run: security delete-keychain "$MACOS_SIGNING_KEYCHAIN" || true
       - name: Keep packaging diagnostics
         if: failure()
         uses: actions/upload-artifact@v4

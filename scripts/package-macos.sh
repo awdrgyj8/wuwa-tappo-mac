@@ -79,6 +79,19 @@ if [ ! -f "$BINARY" ] || [ "$(/usr/bin/lipo -archs "$BINARY")" != arm64 ]; then
   printf '%s\n' '安装包必须包含 Apple Silicon 原生主程序。' >&2
   exit 1
 fi
+# 每次都用同一张证书签名时，macOS 会把新版本视为同一个应用，
+# 输入监控与钥匙串授权在更新后得以保留。未提供证书时沿用临时签名。
+if [ -n "${MACOS_SIGNING_IDENTITY:-}" ]; then
+  phase '使用固定证书签名'
+  SIGN_ARGS=(--force --deep --timestamp=none --preserve-metadata=entitlements --sign "$MACOS_SIGNING_IDENTITY")
+  if [ -n "${MACOS_SIGNING_KEYCHAIN:-}" ]; then SIGN_ARGS+=(--keychain "$MACOS_SIGNING_KEYCHAIN"); fi
+  /usr/bin/codesign "${SIGN_ARGS[@]}" "$APP"
+  REQUIREMENT=$(/usr/bin/codesign --display --requirements - "$APP" 2>&1 | grep '^designated => ' || true)
+  case "$REQUIREMENT" in
+    *"identifier \"$IDENTIFIER\""*certificate*) printf '签名要求：%s\n' "$REQUIREMENT" ;;
+    *) printf '%s\n' '固定证书签名后没有生成基于证书的签名要求。' >&2; exit 1 ;;
+  esac
+fi
 /usr/bin/codesign --verify --deep --strict "$APP"
 
 # Tauri 将前端编译进主程序；检查打包输入及嵌入路径，而不是复制用户数据。

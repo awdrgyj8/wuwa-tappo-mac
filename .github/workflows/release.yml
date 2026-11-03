@@ -22,6 +22,9 @@ jobs:
     uses: ./.github/workflows/build.yml
     with:
       ref: ${{ github.event.inputs.tag || github.ref }}
+    secrets:
+      MACOS_SIGNING_CERTIFICATE: ${{ secrets.MACOS_SIGNING_CERTIFICATE }}
+      MACOS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD }}
   publish:
     needs: build
     runs-on: ubuntu-24.04
