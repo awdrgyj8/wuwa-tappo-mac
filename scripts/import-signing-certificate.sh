@@ -23,7 +23,7 @@ trap 'rm -f "$CERTIFICATE" "$PUBLIC_CERTIFICATE"' EXIT
 
 printf '%s' "$MACOS_SIGNING_CERTIFICATE" | tr -d '[:space:]' | base64 --decode > "$CERTIFICATE"
 security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-security set-keychain-settings -lut 21600 "$KEYCHAIN"
+security set-keychain-settings -lut 900 "$KEYCHAIN"
 security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
 if ! security import "$CERTIFICATE" -k "$KEYCHAIN" -f pkcs12 -P "$MACOS_SIGNING_CERTIFICATE_PASSWORD" -T /usr/bin/codesign >/dev/null; then
   printf '%s\n' '::error::Could not import MACOS_SIGNING_CERTIFICATE. Check that it is the base64 text of the exported .p12 and that the password secret matches.'
