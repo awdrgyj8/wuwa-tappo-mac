@@ -13,8 +13,8 @@ use std::{
     time::Duration,
 };
 use tauri::{
-    AppHandle, Emitter, Listener, LogicalPosition, LogicalSize, Manager, WebviewUrl, WebviewWindow,
-    WebviewWindowBuilder,
+    utils::config::BackgroundThrottlingPolicy, AppHandle, Emitter, Listener, LogicalPosition,
+    LogicalSize, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
 
 /// Closed secondary windows keep a whole WebView process alive while hidden. These ones
@@ -188,6 +188,14 @@ fn refresh_geometry(app: &AppHandle, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// WebKit suspends a page it considers inactive (for example while the screen saver or
+/// another window covers it), which stopped click reporting, the room socket and the
+/// automatic chest claim for as long as the user was away. The always-visible pet
+/// keeps running; other windows keep WebKit's default.
+fn background_policy(label: &str) -> Option<BackgroundThrottlingPolicy> {
+    (label == "main").then_some(BackgroundThrottlingPolicy::Disabled)
+}
+
 fn build_window(
     app: &AppHandle,
     label: &str,
@@ -195,11 +203,15 @@ fn build_window(
     size: (f64, f64),
     focus: bool,
 ) -> Result<WebviewWindow, String> {
-    let window = WebviewWindowBuilder::new(
+    let mut builder = WebviewWindowBuilder::new(
         app,
         label,
         WebviewUrl::App(format!("index.html#{route}").into()),
-    )
+    );
+    if let Some(policy) = background_policy(label) {
+        builder = builder.background_throttling(policy);
+    }
+    let window = builder
     .title(crate::profile::Region::from_app(app).name())
     .initialization_script(initialize(app, label)?)
     .on_page_load(|window, payload| {
@@ -887,6 +899,17 @@ mod tests {
         };
         assert!(passthrough.ignores_cursor(50., 40.));
         assert!(!passthrough.ignores_cursor(520., 520.));
+    }
+
+    #[test]
+    fn only_the_pet_page_keeps_running_while_covered() {
+        assert_eq!(
+            background_policy("main"),
+            Some(BackgroundThrottlingPolicy::Disabled)
+        );
+        for label in ["panel", "login", "about", "update", "toast"] {
+            assert_eq!(background_policy(label), None);
+        }
     }
 
     #[test]
