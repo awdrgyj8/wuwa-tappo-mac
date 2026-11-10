@@ -33,9 +33,10 @@ test('Global About banner and update recovery use Traditional Chinese', () => {
   assert.ok(patchMacUpdater(resolver + failure).includes('官方配置缺少更新资源地址'));
 });
 
-function inputNotice(region, status) {
+function inputNotice(region, status, shortcuts = { error: null }) {
   const nodes = new Map();
-  const invoke = async command => (['get_input_status', 'resume_input_monitor'].includes(command) ? status : undefined);
+  const invoke = async command => (['get_input_status', 'resume_input_monitor'].includes(command) ? status
+    : command === 'get_shortcut_status' ? shortcuts : undefined);
   const window = {
     addEventListener() {}, setInterval() { return 1; }, clearInterval() {},
     __WUWATAPPO_PROFILE__: { region, productName: 'Wuwa Tappo Global Mac' },
@@ -61,6 +62,20 @@ test('Global input permission notices use Traditional Chinese', async () => {
   const cn = inputNotice('CN', { granted: false, running: false, error: null });
   await new Promise(resolve => setImmediate(resolve));
   assert.match(cn(), /键鼠计数已暂停/);
+});
+
+test('Global shortcut notices use Traditional Chinese', async () => {
+  const running = { granted: true, running: true, error: null };
+  const notices = ['occupied', 'unavailable', 'status_unavailable'].map(error => inputNotice('GLOBAL', running, { error }));
+  const clear = inputNotice('GLOBAL', running);
+  const cn = inputNotice('CN', running, { error: 'occupied' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(notices[0](), /^全域快速鍵已被系統或其他 App 佔用/);
+  assert.match(notices[1](), /^全域快速鍵暫時無法使用/);
+  assert.match(notices[2](), /^無法讀取全域快速鍵狀態/);
+  for (const notice of notices) assert.doesNotMatch(notice(), simplified);
+  assert.equal(clear(), undefined);
+  assert.match(cn(), /^全局快捷键被系统或其他应用占用/);
 });
 
 test('Global auto chest menu text uses Traditional Chinese', async () => {
