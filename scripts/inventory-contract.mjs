@@ -51,7 +51,7 @@ function commandContractsFor(clickCacheEnvironment) {
     open_panel_window: { request: object({ payload: object({ tab: { anyOf: [{ type: 'null' }, string] } }) }) },
     open_update_window: { request: object({ detail: { type: 'object' } }) },
     popup_main_dock_context_menu: { request: object({ x: number, y: number }), notes: 'Coordinates supplied by mouse contextmenu handler are local webview CSS pixels.' },
-    resize_login_window_to_content: { request: object({ payload: object({ width: number, height: number }) }) },
+    resize_login_window_to_content: { request: object({ payload: object({ width: number, height: number, keepPosition: optional(boolean) }) }), notes: 'Resize the login window to its content and centre it, unless keepPosition is true (official 1.0.4), which leaves the window where it is.' },
     save_cumulative_click_count: { request: object({ count: clickCount, cuid: string, environment }) },
     save_key_press_count: { request: object({ count: clickCount, environment }), notes: 'Zero is intentional: force persistence is used when clearing pending clicks after successful report or account reconciliation.' },
     set_elevated_autostart: { request: object({ enabled: boolean }) },

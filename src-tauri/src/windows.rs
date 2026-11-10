@@ -586,7 +586,10 @@ pub fn dispatch(
                 .get_webview_window("login")
                 .ok_or("Login window is unavailable")?;
             w.set_size(LogicalSize::new(width, height)).map_err(err)?;
-            center_on_main(app, &w)?;
+            // Official 1.0.4 can ask to leave a login window where the user dragged it.
+            if p.get("keepPosition").and_then(Value::as_bool) != Some(true) {
+                center_on_main(app, &w)?;
+            }
         }
         "raise_panel_window_above_pets" => {
             let w = app

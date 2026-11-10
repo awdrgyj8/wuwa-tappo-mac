@@ -8,7 +8,8 @@ import { patchMacShortcutLabels } from '../scripts/patch-frontend.mjs';
 import { contract, profile, root, findSource } from './frontend-context.mjs';
 
 const main = findSource(source => source.includes('const DEFAULT_APP_SHORTCUTS='));
-const view = findSource(source => source.includes('function Ch(e)'));
+// Minified names below follow official 1.0.4.
+const view = findSource(source => source.includes('function Ip(e)'));
 const settings = findSource(source => source.includes('__name:"ShortcutInput"'));
 
 function nodes(source) {
@@ -64,25 +65,25 @@ test('official shortcut bindings retain VK values while macOS displays Option an
 });
 
 test('official settings save the complete shortcut map and retain actionable native errors', async () => {
-  const save = declaration(settings.source, 'T', node => settings.source.slice(node.start, node.end).includes('set_app_shortcuts'));
+  const save = declaration(settings.source, 'O', node => settings.source.slice(node.start, node.end).includes('set_app_shortcuts'));
   for (const error of [null, 'duplicate', 'occupied', 'unavailable']) {
     const events = [], warnings = [], calls = [];
     const old = { gameMode: { modifiers: 0, key: 118 }, switchScreen: { modifiers: 0, key: 119 }, togglePet: { modifiers: 0, key: 120 } };
     const env = vm.createContext({
-      A: { value: false }, O: { value: 'recording' }, t: { action: 'togglePet' },
-      qs: operation => operation(), ps: async () => structuredClone(old),
-      ms: async (command, payload) => { calls.push({ command, payload: structuredClone(payload) }); if (error) throw error; },
-      B: (type, payload) => events.push({ type, payload: structuredClone(payload) }),
-      g: key => key, Oe: key => warnings.push(key),
+      E: { value: false }, D: { value: 'recording' }, s: { action: 'togglePet' },
+      Ys: operation => operation(), ps: async () => structuredClone(old),
+      gs: async (command, payload) => { calls.push({ command, payload: structuredClone(payload) }); if (error) throw error; },
+      N: (type, payload) => events.push({ type, payload: structuredClone(payload) }),
+      m: key => key, Ne: key => warnings.push(key),
     });
     vm.runInContext(save, env);
-    await env.T({ modifiers: 8, key: 75 });
-    assert.equal(env.A.value, false);
+    await env.O({ modifiers: 8, key: 75 });
+    assert.equal(env.E.value, false);
     assert.deepEqual(calls, [{ command: 'set_app_shortcuts', payload: { config: { ...old, togglePet: { modifiers: 8, key: 75 } } } }]);
     if (error) {
       assert.deepEqual(events, []);
       assert.deepEqual(warnings, [`setting_shortcut_${error}`]);
-      assert.equal(env.O.value, '');
+      assert.equal(env.D.value, '');
     } else {
       assert.deepEqual(events, [{ type: 'change', payload: calls[0].payload.config }]);
       assert.deepEqual(warnings, []);
@@ -91,60 +92,62 @@ test('official settings save the complete shortcut map and retain actionable nat
 });
 
 test('official shortcut capture does not reactivate a blurred field after a delayed native reply', async () => {
-  const focus = declaration(settings.source, 'M', node => settings.source.slice(node.start, node.end).includes('Gt(!0)'));
-  const blur = declaration(settings.source, 'P', node => settings.source.slice(node.start, node.end).includes('Gt(!1)'));
+  const focus = declaration(settings.source, 'h', node => settings.source.slice(node.start, node.end).includes('zt(!0)'));
+  const blur = declaration(settings.source, 'T', node => settings.source.slice(node.start, node.end).includes('zt(!1)'));
   let finish;
   const calls = [];
   const env = vm.createContext({
-    z: 0, C: { value: false }, f: { value: false }, O: { value: '' }, V: null,
-    Gt: active => { calls.push(active); return active ? new Promise(resolve => { finish = resolve; }) : Promise.resolve(); },
-    Oe: () => assert.fail('Unexpected capture error'), g: key => key, v: { value: { blur() {} } },
+    U: 0, M: { value: false }, p: { value: false }, D: { value: '' }, H: null,
+    zt: active => { calls.push(active); return active ? new Promise(resolve => { finish = resolve; }) : Promise.resolve(); },
+    Ne: () => assert.fail('Unexpected capture error'), m: key => key, d: { value: { blur() {} } },
   });
   vm.runInContext(focus + blur, env);
-  const pending = env.M();
-  assert.equal(env.C.value, true);
-  assert.equal(env.f.value, false);
-  env.P();
+  const pending = env.h();
+  assert.equal(env.M.value, true);
+  assert.equal(env.p.value, false);
+  env.T();
   finish();
   await pending;
   assert.deepEqual(calls, [true, false]);
-  assert.equal(env.C.value, false);
-  assert.equal(env.f.value, false);
+  assert.equal(env.M.value, false);
+  assert.equal(env.p.value, false);
 });
 
 test('official app-shortcut consumer dispatches exactly one enabled action and honors the lock', () => {
-  const handler = declaration(view.source, 'Ch');
+  const handler = declaration(view.source, 'Ip');
   for (const locked of [false, true]) for (const enabled of [false, true]) {
     const effects = [];
     const env = vm.createContext({
-      Ie: () => locked, ly: () => enabled, uy: () => enabled,
-      mc: () => effects.push('togglePet'), Th: () => effects.push('gameMode'),
-      [profile.id === 'cn' ? 'Pv' : 'Dv']: () => enabled,
-      [profile.id === 'cn' ? 'Tv' : 'Lv']: () => effects.push('switchScreen'),
+      Pe: () => locked, py: () => enabled, vy: () => enabled,
+      wc: () => effects.push('togglePet'), Fp: () => effects.push('gameMode'),
+      [profile.id === 'cn' ? 'Nv' : 'Uv']: () => enabled,
+      [profile.id === 'cn' ? 'Hv' : 'Vv']: () => effects.push('switchScreen'),
     });
     vm.runInContext(handler, env);
-    for (const action of ['togglePet', 'gameMode', 'switchScreen', 'unknown']) env.Ch(action);
+    for (const action of ['togglePet', 'gameMode', 'switchScreen', 'unknown']) env.Ip(action);
     assert.deepEqual(effects, !locked && enabled ? ['togglePet', 'gameMode', 'switchScreen'] : []);
   }
   assert.deepEqual(contract.events.find(event => event.name === 'app-shortcut').payload.enum, ['gameMode', 'switchScreen', 'togglePet']);
 });
 
 test('official fullscreen automation follows transitions without clearing a manually enabled mode when disabled', () => {
-  const handler = declaration(view.source, 'Ph');
+  const handler = declaration(view.source, 'Op');
   const settings = { autoGameModeOnFullscreen: true };
-  const effects = [], notices = [];
+  const effects = [];
   const env = vm.createContext({
-    ma: false, Qt: { value: false }, xt: () => settings,
-    Ga: value => { env.Qt.value = value; effects.push(value); }, mt: key => notices.push(key), $: key => key,
+    _a: false, tn: { value: false }, Et: () => settings,
+    $a: value => { env.tn.value = value; effects.push(value); },
   });
   vm.runInContext(handler, env);
-  for (const fullscreen of [false, true, true, false, false]) env.Ph(fullscreen);
+  for (const fullscreen of [false, true, true, false, false]) env.Op(fullscreen);
   assert.deepEqual(effects, [true, false]);
-  assert.deepEqual(notices, ['game_mode_entered', 'game_mode_exited']);
+  // Since 1.0.4 the view announces every game mode change from its state watcher, not from this handler.
+  assert.equal(handler.includes('game_mode_entered'), false);
+  assert.equal(view.source.split('"game_mode_entered":"game_mode_exited"').length, 2);
   settings.autoGameModeOnFullscreen = false;
-  env.Qt.value = true;
-  env.Ph(false);
-  assert.equal(env.Qt.value, true);
+  env.tn.value = true;
+  env.Op(false);
+  assert.equal(env.tn.value, true);
   assert.deepEqual(effects, [true, false]);
 });
 
@@ -155,8 +158,7 @@ test('official desktop-safe-area consumer keeps application fullscreen separate 
   let reply;
   const env = vm.createContext({
     u: async command => command === 'get_main_desktop_safe_area' ? reply : insets,
-    B: insets, F: null, D: false, he: false, q: null, we: insets,
-    [profile.id === 'cn' ? 'V' : '$']: insets,
+    B: insets, F: null, D: false, he: false, q: null, we: insets, V: insets,
     console: { warn: () => assert.fail('Unexpected safe-area failure') },
   });
   vm.runInContext(functions, env);

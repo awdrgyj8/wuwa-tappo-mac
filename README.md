@@ -5,7 +5,7 @@
 
 **把 Wuwa Tappo 国服和国际服带到 Mac。** 保留各服界面、角色资源和官方服务，使用 Rust + Tauri 重建 macOS 原生后端，不需要 Wine、Windows 或虚拟机。
 
-这是社区维护的**非官方 macOS 适配版**。国服和国际服分别打包，目前均对齐官方 **1.0.3**，各自检查和跟进官方更新。
+这是社区维护的**非官方 macOS 适配版**。国服和国际服分别打包，目前均对齐官方 **1.0.4**，各自检查和跟进官方更新。
 
 ## 下载与使用
 
@@ -111,7 +111,7 @@ npm run package
 
 ```bash
 export WUWA_REGION=cn
-npm run assets:sync -- --installer "$HOME/Downloads/WuwaTappo-cn_1.0.3_x64-setup.exe"
+npm run assets:sync -- --installer "$HOME/Downloads/WuwaTappo-cn_1.0.4_x64-setup.exe"
 npm run icons
 npm run prepare:frontend
 ```
@@ -121,7 +121,7 @@ npm run prepare:frontend
 ## CI/CD 与官方版本同步
 
 - **提交 / Pull Request：** 国服与国际服分别执行下载、JavaScript / Rust 测试、原生构建与完整 ZIP / DMG 打包，构建产物和缓存按区域隔离。
-- **版本发布：** 推送 `v*` 标签（如 `v1.0.3-mac.1`）后执行双服检查；全部通过才向同一个 Release 发布四个安装包。也支持手动发布。
+- **版本发布：** 推送 `v*` 标签（如 `v1.0.4-mac.1`）后执行双服检查；全部通过才向同一个 Release 发布四个安装包。也支持手动发布。
 - **官方同步：** 每天分别检查两服官方更新。兼容检查与打包通过后创建更新 PR；提取成功但尚未适配时创建草稿 PR，并保存接口差异与失败日志。持续失败时提交对应地区的问题，未经验证的版本不会自动发布。
 - **构建源：** 已验证的安装包按地区与官方资源锁缓存，每次复用仍校验完整性。CI 无缓存时先从官方下载；瞬态网络错误重试耗尽后，可使用本仓库 [构建源镜像](https://github.com/Last-emo-boy/wuwa-tappo-mac/releases/tag/upstream-resources) 中按官方 SHA-256 固定的原包，仍核对原锁的大小与摘要。官方版本发现和新资源锁定始终访问官方源；镜像文件不是 Mac 安装入口。
 

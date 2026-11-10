@@ -1,12 +1,12 @@
 {
   "schemaVersion": 2,
-  "application": "WuwaTappo-cn 1.0.3",
+  "application": "WuwaTappo-cn 1.0.4",
   "region": "CN",
   "source": {
-    "main": "index-CuzHFfJW.js",
-    "room": "index-pp8VWaUF.js",
-    "login": "useLogin-pKgL9g9U.js",
-    "loginView": "login-B1hThJN-.js"
+    "main": "index-CM6qA69G.js",
+    "room": "index-BFg5ADH5.js",
+    "login": "useLogin-DsKO81zl.js",
+    "loginView": "login-6yi5hIzI.js"
   },
   "http": {
     "baseUrl": "https://api-mc-wuwatappo.kurogames-global.com",
@@ -27,7 +27,7 @@
       {"method": "GET", "path": "/api/frontend/user/me", "parameters": []},
       {"method": "POST", "path": "/api/auth/uid-send-code", "parameters": ["playerId"]},
       {"method": "POST", "path": "/api/auth/uid-login", "parameters": ["playerId", "code"]},
-      {"method": "POST", "path": "/api/auth/player/query", "parameters": ["cuid", "is_domestic"]},
+      {"method": "POST", "path": "/api/auth/player/query", "parameters": ["cuid", "is_domestic", "accessToken", "cname"]},
       {"method": "GET", "path": "/api/frontend/user/renew-token", "parameters": []},
       {"method": "GET", "path": "/api/common/activity-config", "parameters": []},
       {"method": "GET", "path": "/api/common/atlas", "parameters": []},
@@ -67,7 +67,7 @@
       "sessionConfigurationKeys": ["__KrSDK__", "__KrSDK_SYS_CONF__"],
       "localDeviceIdKey": "__KrSDK_UUID__"
     },
-    "playerQuery": {"path": "/api/auth/player/query", "is_domestic": 1},
+    "playerQuery": {"path": "/api/auth/player/query", "is_domestic": 1, "credentials": "SDK token as accessToken and SDK username as cname"},
     "businessLogin": {"path": "/api/auth/login", "source": "sdk", "is_domestic": 1},
     "viewOpenedEvent": "cat-inland-login-view-opened",
     "loginSuccessEvent": "cat-auth-login-success",

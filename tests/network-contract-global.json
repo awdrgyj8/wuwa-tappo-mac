@@ -1,12 +1,12 @@
 {
   "schemaVersion": 2,
-  "application": "WuwaTappo-global 1.0.3",
+  "application": "WuwaTappo-global 1.0.4",
   "region": "GLOBAL",
   "source": {
-    "main": "index-DnHotUmh.js",
-    "room": "index-CxsrU06E.js",
-    "login": "index-DnHotUmh.js",
-    "loginView": "login-BEc7g7o3.js"
+    "main": "index-CBYJTno0.js",
+    "room": "index-DRyeCNeO.js",
+    "login": "index-CBYJTno0.js",
+    "loginView": "login-Cvjq6MjV.js"
   },
   "http": {
     "baseUrl": "https://api-wutheringwaves-wuwatappo.kurogames-global.com",
@@ -91,7 +91,9 @@
         "path": "/api/auth/player/query",
         "parameters": [
           "cuid",
-          "is_domestic"
+          "is_domestic",
+          "accessToken",
+          "cname"
         ]
       },
       {
@@ -207,7 +209,8 @@
     "nativeDeepLinkRequired": true,
     "playerQuery": {
       "path": "/api/auth/player/query",
-      "is_domestic": 0
+      "is_domestic": 0,
+      "credentials": "OAuth access token as accessToken and account name as cname"
     },
     "businessLogin": {
       "path": "/api/auth/login",

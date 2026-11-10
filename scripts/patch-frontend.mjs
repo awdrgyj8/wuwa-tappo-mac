@@ -34,15 +34,19 @@ export function patchDomesticSdkUrls(source) {
   return patched;
 }
 
+// The official CN SDK loader and the helper declared right after it. Minified names change with
+// every official build, so the loader is recognised by its shape instead.
+export function domesticLoginLoader(source) {
+  const starts = [...source.matchAll(/async function ([$\w]+)\(e=!1\)\{if\(([$\w]+)\)return \2;if\(!e&&[$\w]+\(\)\)try\{return [$\w]+\(\),!0\}/g)];
+  const next = starts.length === 1 ? /\}\s*async function ([$\w]+)\(\)\{/.exec(source.slice(starts[0].index)) : null;
+  if (!next) throw new Error('Original CN SDK reload function changed; reconcile the login reload patch before building.');
+  const offset = starts[0].index;
+  return { name: starts[0][1], next: next[1], offset, limit: offset + next.index + 1 };
+}
+
 export function patchDomesticLoginReload(source) {
-  const start = 'async function we(e=!1){if(E)return E;if(!e&&$())';
-  const end = 'async function me()';
   const insertion = ',document.head.appendChild(t),r=window.setTimeout(';
-  const offset = source.indexOf(start);
-  const limit = source.indexOf(end, offset);
-  if (offset < 0 || limit < 0 || source.split(start).length !== 2) {
-    throw new Error('Original CN SDK reload function changed; reconcile the login reload patch before building.');
-  }
+  const { offset, limit } = domesticLoginLoader(source);
   const loader = source.slice(offset, limit);
   if (!loader.includes('t.dataset.kuroSdkRetry="true"') || loader.split(insertion).length !== 2) {
     throw new Error('Original CN SDK script insertion changed; reconcile the login reload patch before building.');

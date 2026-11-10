@@ -2,15 +2,18 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
-import { patchDomesticLoginReload } from '../scripts/patch-frontend.mjs';
+import { domesticLoginLoader, patchDomesticLoginReload } from '../scripts/patch-frontend.mjs';
 import { profile, findSource } from './frontend-context.mjs';
 
 const original = profile.region === 'CN'
-  ? findSource(source => source.includes('async function we(e=!1)')).source
+  ? findSource(source => source.includes('t.dataset.kuroSdkRetry="true"')).source
   : await readFile(new URL('./fixtures/domestic-sdk-loader.js', import.meta.url), 'utf8');
 const renderer = await readFile(new URL('./fixtures/kuro-sdk-preact.js', import.meta.url), 'utf8');
 const patched = patchDomesticLoginReload(original);
-const loader = patched.slice(patched.indexOf('async function we(e=!1)'), patched.indexOf('async function me()'));
+const bounds = domesticLoginLoader(patched);
+const loader = patched.slice(bounds.offset, bounds.limit);
+// Minified names of official CN 1.0.4; tests/fixtures/domestic-sdk-loader.js keeps the same build.
+assert.deepEqual([bounds.name, bounds.next], ['ge', 'Se']);
 
 function setup({ loaded = true, root = { childNodes: [], firstChild: null } } = {}) {
   const actions = [];
@@ -29,12 +32,12 @@ function setup({ loaded = true, root = { childNodes: [], firstChild: null } } = 
   const context = vm.createContext({
     document, console,
     window: { setTimeout() { return 1; }, clearTimeout() {} },
-    E: null, S: null, b: null, R: null, x: 0, u: 'ready', te: null, W: 0, We: 8000,
-    $: () => loaded, re: () => actions.push('existing-sdk-initialized'),
-    tn: () => oldScript.src, l() {}, c() {},
+    y: null, f: null, D: null, U: 0, c: 'ready', Q: null, q: 0, Be: 8000,
+    b: () => loaded, W: () => actions.push('existing-sdk-initialized'),
+    Ze: () => oldScript.src, l() {}, a() {},
   });
   vm.runInContext(loader, context);
-  return { actions, outer, appended, document, context, reload: force => context.we(force) };
+  return { actions, outer, appended, document, context, reload: force => context.ge(force) };
 }
 
 test('only forced reload removes the exact old SDK script and SDK root before insertion', async () => {
