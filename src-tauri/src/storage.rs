@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{
@@ -76,10 +76,12 @@ impl CounterStore {
             .lock()
             .map_err(|_| "counter_store_lock_poisoned")?;
         let mut data = self.read()?;
-        data.environments
-            .entry(environment.to_owned())
-            .or_default()
-            .key_press = count;
+        let entry = data.environments.entry(environment.to_owned()).or_default();
+        if entry.key_press == count {
+            // The frontend re-saves unchanged totals; each write is a full flush.
+            return Ok(());
+        }
+        entry.key_press = count;
         self.write(&data)
     }
 
@@ -117,20 +119,25 @@ impl CounterStore {
             .map_err(|_| "counter_store_lock_poisoned")?;
         let mut data = self.read()?;
         let entry = data.environments.entry(environment.to_owned()).or_default();
+        if entry.cumulative.get(cuid) == Some(&count) && entry.active_cuid.as_deref() == Some(cuid)
+        {
+            return Ok(());
+        }
         entry.cumulative.insert(cuid.to_owned(), count);
         entry.active_cuid = Some(cuid.to_owned());
         self.write(&data)
     }
 
     fn read(&self) -> Result<CounterData, String> {
-        let file = match File::open(&self.path) {
-            Ok(file) => file,
+        // One read(2) for the whole file; serde_json's reader would issue one per byte.
+        let bytes = match fs::read(&self.path) {
+            Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Ok(CounterData::default())
             }
             Err(error) => return Err(format!("counter_store_read_failed: {error}")),
         };
-        let data: CounterData = serde_json::from_reader(file)
+        let data: CounterData = serde_json::from_slice(&bytes)
             .map_err(|error| format!("counter_store_invalid_json: {error}"))?;
         if data.version != 1 {
             return Err(format!(
@@ -179,9 +186,10 @@ impl CounterStore {
             let mut file = options
                 .open(&temporary)
                 .map_err(|error| format!("counter_store_write_failed: {error}"))?;
-            serde_json::to_writer(&mut file, data)
+            let mut encoded = serde_json::to_vec(data)
                 .map_err(|error| format!("counter_store_serialize_failed: {error}"))?;
-            file.write_all(b"\n")
+            encoded.push(b'\n');
+            file.write_all(&encoded)
                 .and_then(|_| file.sync_all())
                 .map_err(|error| format!("counter_store_sync_failed: {error}"))?;
             fs::rename(&temporary, &self.path)
@@ -228,39 +236,57 @@ fn create_private_directory(path: &Path) -> io::Result<()> {
     builder.create(path)
 }
 
-#[tauri::command]
-pub fn load_key_press_count(
-    store: tauri::State<'_, CounterStore>,
-    environment: String,
-) -> Result<u64, String> {
-    store.load_key_press(&environment)
+// Synchronous commands run on the main thread, where a full-flush write would
+// stall AppKit and WebKit. These run on the blocking pool instead.
+async fn with_store<T, F>(app: tauri::AppHandle, operation: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&CounterStore) -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(move || {
+        use tauri::Manager;
+        operation(&app.state::<CounterStore>())
+    })
+    .await
+    .map_err(|error| format!("counter_store_task_failed: {error}"))?
 }
 
 #[tauri::command]
-pub fn save_key_press_count(
-    store: tauri::State<'_, CounterStore>,
+pub async fn load_key_press_count(
+    app: tauri::AppHandle,
+    environment: String,
+) -> Result<u64, String> {
+    with_store(app, move |store| store.load_key_press(&environment)).await
+}
+
+#[tauri::command]
+pub async fn save_key_press_count(
+    app: tauri::AppHandle,
     count: u64,
     environment: String,
 ) -> Result<(), String> {
-    store.save_key_press(&environment, count)
+    with_store(app, move |store| store.save_key_press(&environment, count)).await
 }
 
 #[tauri::command]
-pub fn load_cumulative_click_count(
-    store: tauri::State<'_, CounterStore>,
+pub async fn load_cumulative_click_count(
+    app: tauri::AppHandle,
     environment: String,
 ) -> Result<CumulativeClickCount, String> {
-    store.load_cumulative(&environment)
+    with_store(app, move |store| store.load_cumulative(&environment)).await
 }
 
 #[tauri::command]
-pub fn save_cumulative_click_count(
-    store: tauri::State<'_, CounterStore>,
+pub async fn save_cumulative_click_count(
+    app: tauri::AppHandle,
     count: u64,
     cuid: String,
     environment: String,
 ) -> Result<(), String> {
-    store.save_cumulative(&environment, &cuid, count)
+    with_store(app, move |store| {
+        store.save_cumulative(&environment, &cuid, count)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -327,6 +353,41 @@ mod tests {
                 .load_key_press("global-global-prod")
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn unchanged_saves_do_not_rewrite_the_store() {
+        let directory = TestDirectory::new();
+        let store = directory.store();
+        store.save_key_press("global-global-prod", 5).unwrap();
+        store
+            .save_cumulative("global-global-prod", "account-a", 9)
+            .unwrap();
+        // Replace the file with an equivalent encoding: an unchanged save keeps it.
+        let marker = format!(
+            "{}\n\n",
+            String::from_utf8(fs::read(&store.path).unwrap())
+                .unwrap()
+                .trim_end()
+        );
+        fs::write(&store.path, &marker).unwrap();
+        store.save_key_press("global-global-prod", 5).unwrap();
+        store
+            .save_cumulative("global-global-prod", "account-a", 9)
+            .unwrap();
+        assert_eq!(fs::read_to_string(&store.path).unwrap(), marker);
+        // Switching the active account is a change even when the count matches.
+        store
+            .save_cumulative("global-global-prod", "account-b", 9)
+            .unwrap();
+        store
+            .save_cumulative("global-global-prod", "account-a", 9)
+            .unwrap();
+        assert_ne!(fs::read_to_string(&store.path).unwrap(), marker);
+        assert_eq!(
+            store.load_cumulative("global-global-prod").unwrap().cuid,
+            "account-a"
         );
     }
 

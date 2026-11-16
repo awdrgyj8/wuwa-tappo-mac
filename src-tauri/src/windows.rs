@@ -10,7 +10,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex, RwLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::{
     utils::config::BackgroundThrottlingPolicy, AppHandle, Emitter, Listener, LogicalPosition,
@@ -21,6 +21,17 @@ use tauri::{
 /// rebuild cleanly from their route, so they are destroyed after staying closed for a while.
 const RELEASABLE_WINDOWS: &[&str] = &["panel", "about", "oss-notice", "update"];
 const RELEASE_CLOSED_WINDOW_AFTER: Duration = Duration::from_secs(60);
+
+// Click-through follows the cursor. The input tap reports every movement while
+// it runs; otherwise a background thread samples the cursor through CoreGraphics.
+// Neither path needs the main thread unless the click-through state changes.
+const PASSTHROUGH_MOVING_POLL: Duration = Duration::from_millis(16);
+const PASSTHROUGH_IDLE_POLL: Duration = Duration::from_millis(100);
+const PASSTHROUGH_TAP_POLL: Duration = Duration::from_millis(250);
+const PASSTHROUGH_SETTLE: Duration = Duration::from_secs(1);
+const GEOMETRY_SAFETY_REFRESH: Duration = Duration::from_secs(2);
+// Logical pixels around pet/dock content that still count as "near" for input pacing.
+const INTERACTIVE_MARGIN: f64 = 64.;
 
 pub const COMMANDS: &[&str] = &[
     "apply_main_window_position",
@@ -79,6 +90,12 @@ pub struct WindowState {
     stop: AtomicBool,
     closed: Mutex<BTreeMap<String, u64>>,
     close_generation: AtomicU64,
+    /// Click-through state the cursor currently calls for.
+    passthrough: Mutex<Option<bool>>,
+    /// Click-through state last set on the window (main thread only).
+    passthrough_applied: Mutex<Option<bool>>,
+    /// Last time the input tap reported the cursor.
+    cursor_observed_at: Mutex<Option<Instant>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -188,6 +205,77 @@ fn refresh_geometry(app: &AppHandle, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Applies main-window click-through for a global logical cursor point. Only a
+/// change reaches AppKit; everything else comes from cached geometry and regions.
+fn apply_passthrough(app: &AppHandle, x: f64, y: f64) -> Result<(), String> {
+    let state = app.state::<WindowState>();
+    let geometry = *state.main_geometry.read().map_err(err)?;
+    let ignored = state
+        .hit
+        .read()
+        .map_err(err)?
+        .ignores_cursor(x - geometry.left, y - geometry.top);
+    {
+        let mut desired = state.passthrough.lock().map_err(err)?;
+        if *desired == Some(ignored) {
+            return Ok(());
+        }
+        *desired = Some(ignored);
+    }
+    // Callers on other threads reach AppKit through the event loop while main-
+    // thread callers do not, so requests can arrive out of order. The main thread
+    // therefore applies whatever state is desired when it runs, never a stale one.
+    if objc2::MainThreadMarker::new().is_some() {
+        return sync_passthrough(app);
+    }
+    let handle = app.clone();
+    app.run_on_main_thread(move || {
+        if let Err(error) = sync_passthrough(&handle) {
+            eprintln!("Click-through update failed: {error}");
+        }
+    })
+    .map_err(err)
+}
+
+fn sync_passthrough(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<WindowState>();
+    let Some(desired) = *state.passthrough.lock().map_err(err)? else {
+        return Ok(());
+    };
+    let mut applied = state.passthrough_applied.lock().map_err(err)?;
+    if *applied != Some(desired) {
+        main_window(app)?
+            .set_ignore_cursor_events(desired)
+            .map_err(err)?;
+        *applied = Some(desired);
+    }
+    Ok(())
+}
+
+/// Re-evaluates click-through at the current cursor after regions, flags or
+/// geometry changed, instead of waiting for the next movement.
+fn refresh_passthrough(app: &AppHandle) -> Result<(), String> {
+    match crate::input::cursor_location() {
+        Some((x, y)) => apply_passthrough(app, x, y),
+        None => Ok(()),
+    }
+}
+
+/// Records a click-through state that a command set on the window directly
+/// (main thread), so queued updates and later changes compare against it.
+fn assume_passthrough(app: &AppHandle, ignored: bool) -> Result<(), String> {
+    let state = app.state::<WindowState>();
+    *state.passthrough.lock().map_err(err)? = Some(ignored);
+    *state.passthrough_applied.lock().map_err(err)? = Some(ignored);
+    Ok(())
+}
+
+/// Main-thread refresh after the main window was moved or resized by a command.
+fn refresh_main_layout(app: &AppHandle) -> Result<(), String> {
+    refresh_geometry(app, "main")?;
+    refresh_passthrough(app)
+}
+
 /// WebKit suspends a page it considers inactive (for example while the screen saver or
 /// another window covers it), which stopped click reporting, the room socket and the
 /// automatic chest claim for as long as the user was away. The always-visible pet
@@ -266,7 +354,12 @@ fn build_window(
                         .read()
                         .is_ok_and(|windows| windows.contains_key(&label));
                 if tracked {
-                    if let Err(error) = refresh_geometry(&app, &label) {
+                    let refreshed = if label == "main" {
+                        refresh_main_layout(&app)
+                    } else {
+                        refresh_geometry(&app, &label)
+                    };
+                    if let Err(error) = refreshed {
                         eprintln!("Could not refresh {label} geometry: {error}");
                     }
                 }
@@ -322,13 +415,21 @@ fn show_aux(
     Ok((window, existed))
 }
 
+// `Option::or` would evaluate the primary-display query even when the current
+// display is known; each query enumerates NSScreen.
+fn current_or_primary_monitor(window: &WebviewWindow) -> Result<tauri::Monitor, String> {
+    match window.current_monitor().map_err(err)? {
+        Some(monitor) => Ok(monitor),
+        None => window
+            .primary_monitor()
+            .map_err(err)?
+            .ok_or_else(|| "No display is available".into()),
+    }
+}
+
 fn center_on_main(app: &AppHandle, window: &WebviewWindow) -> Result<(), String> {
     let main = main_window(app)?;
-    let monitor = main
-        .current_monitor()
-        .map_err(err)?
-        .or(main.primary_monitor().map_err(err)?)
-        .ok_or("No display is available")?;
+    let monitor = current_or_primary_monitor(&main)?;
     let size = window
         .outer_size()
         .map_err(err)?
@@ -345,11 +446,7 @@ fn center_on_main(app: &AppHandle, window: &WebviewWindow) -> Result<(), String>
 
 fn fullscreen_shell(app: &AppHandle) -> Result<(), String> {
     let w = main_window(app)?;
-    let monitor = w
-        .current_monitor()
-        .map_err(err)?
-        .or(w.primary_monitor().map_err(err)?)
-        .ok_or("No display is available")?;
+    let monitor = current_or_primary_monitor(&w)?;
     w.set_position(*monitor.position()).map_err(err)?;
     w.set_size(*monitor.size()).map_err(err)?;
     Ok(())
@@ -631,13 +728,16 @@ pub fn dispatch(
             {
                 return Err("Invalid hit region geometry".into());
             }
-            let mut hit = state.hit.write().map_err(err)?;
-            hit.regions = update.regions;
-            if update.update_native_input {
-                hit.input_regions = update.input_regions;
+            {
+                let mut hit = state.hit.write().map_err(err)?;
+                hit.regions = update.regions;
+                if update.update_native_input {
+                    hit.input_regions = update.input_regions;
+                }
+                hit.window_passthrough = update.window_passthrough;
+                hit.force_ignore = false;
             }
-            hit.window_passthrough = update.window_passthrough;
-            hit.force_ignore = false;
+            refresh_passthrough(app)?;
         }
         "set_main_force_cursor_ignore" => {
             state.hit.write().map_err(err)?.force_ignore = args
@@ -647,6 +747,8 @@ pub fn dispatch(
             main_window(app)?
                 .set_ignore_cursor_events(true)
                 .map_err(err)?;
+            assume_passthrough(app, true)?;
+            refresh_passthrough(app)?;
         }
         "set_main_swallow_mouse" => {
             let enabled = args
@@ -658,9 +760,14 @@ pub fn dispatch(
                 main_window(app)?
                     .set_ignore_cursor_events(false)
                     .map_err(err)?;
+                assume_passthrough(app, false)?;
             }
+            refresh_passthrough(app)?;
         }
-        "set_main_window_fullscreen_shell" => fullscreen_shell(app)?,
+        "set_main_window_fullscreen_shell" => {
+            fullscreen_shell(app)?;
+            refresh_main_layout(app)?;
+        }
         "set_main_window_monitor_bounds" => {
             let p = payload(args);
             let x = number(p, "x")?;
@@ -673,6 +780,7 @@ pub fn dispatch(
             let w = main_window(app)?;
             state.hit.write().map_err(err)?.force_ignore = true;
             w.set_ignore_cursor_events(true).map_err(err)?;
+            assume_passthrough(app, true)?;
             let target = w
                 .available_monitors()
                 .map_err(err)?
@@ -689,9 +797,11 @@ pub fn dispatch(
                 .map_err(err)?;
             w.set_size(LogicalSize::new(width / scale, height / scale))
                 .map_err(err)?;
+            refresh_main_layout(app)?;
         }
         "finish_main_window_monitor_switch" => {
             state.hit.write().map_err(err)?.force_ignore = false;
+            refresh_passthrough(app)?;
         }
         "set_main_window_content_bounds" => {
             let p = payload(args);
@@ -706,6 +816,7 @@ pub fn dispatch(
                     .map_err(err)?;
             }
             w.set_size(LogicalSize::new(width, height)).map_err(err)?;
+            refresh_main_layout(app)?;
         }
         "apply_main_window_position" => {
             let top = payload(args)
@@ -716,6 +827,7 @@ pub fn dispatch(
             // In the original fullscreen shell the Vue dock, not the OS window,
             // applies the selected corner; moving this window would move it twice.
             fullscreen_shell(app)?;
+            refresh_main_layout(app)?;
         }
         "sync_main_window_to_current_monitor" => {
             let w = main_window(app)?;
@@ -792,6 +904,7 @@ pub fn setup(app: &AppHandle) -> Result<(), String> {
     fullscreen_shell(app)?;
     refresh_geometry(app, "main")?;
     w.set_ignore_cursor_events(true).map_err(err)?;
+    assume_passthrough(app, true)?;
     w.show().map_err(err)?;
     if cfg!(debug_assertions) && std::env::args().any(|arg| arg == "--inspect") {
         w.open_devtools();
@@ -838,46 +951,98 @@ pub fn setup(app: &AppHandle) -> Result<(), String> {
             eprintln!("Could not schedule input access request: {error}");
         }
     });
-    // Poll the cursor without main-thread round trips: CoreGraphics reports it in the same
-    // global top-left points as the cached main-window geometry. The main thread is only
-    // touched when the pass-through state actually changes.
-    std::thread::spawn({
-        let app = app.clone();
-        move || {
-            let mut previous = None;
-            loop {
-                let state = app.state::<WindowState>();
-                if state.stop.load(Ordering::Acquire) {
-                    break;
-                }
-                let Some(w) = app.get_webview_window("main") else {
-                    break;
-                };
-                let result = (|| -> Result<(), String> {
-                    let Some((cursor_x, cursor_y)) = crate::input::cursor_location() else {
-                        return Ok(());
-                    };
-                    let geometry = *state.main_geometry.read().map_err(err)?;
-                    let ignored = state
-                        .hit
-                        .read()
-                        .map_err(err)?
-                        .ignores_cursor(cursor_x - geometry.left, cursor_y - geometry.top);
-                    if previous != Some(ignored) {
-                        w.set_ignore_cursor_events(ignored).map_err(err)?;
-                        previous = Some(ignored);
-                    }
-                    Ok(())
-                })();
-                if let Err(error) = result {
-                    eprintln!("Hit region update stopped: {error}");
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(16));
+    let app_for_pacing = app.clone();
+    app.state::<crate::input::InputMonitor>()
+        .set_interactive_hit_test(move |x, y| {
+            let state = app_for_pacing.state::<WindowState>();
+            let (Ok(geometry), Ok(hit)) = (state.main_geometry.read(), state.hit.read()) else {
+                return true;
+            };
+            let (x, y) = (
+                x / geometry.scale - geometry.left,
+                y / geometry.scale - geometry.top,
+            );
+            hit.input_regions
+                .iter()
+                .chain(hit.regions.iter())
+                .any(|r| r.near(x, y, INTERACTIVE_MARGIN))
+        })?;
+    let app_for_cursor = app.clone();
+    app.state::<crate::input::InputMonitor>()
+        .set_cursor_observer(move |x, y| {
+            let state = app_for_cursor.state::<WindowState>();
+            if let Ok(mut observed) = state.cursor_observed_at.lock() {
+                *observed = Some(Instant::now());
+            }
+            // The fallback thread reports persistent failures; one event must not log.
+            let _ = apply_passthrough(&app_for_cursor, x, y);
+        })?;
+    std::thread::Builder::new()
+        .name("wuwatappo-passthrough".into())
+        .spawn({
+            let app = app.clone();
+            move || passthrough_fallback(app)
+        })
+        .map_err(err)?;
+    Ok(())
+}
+
+/// Keeps click-through correct when the input tap is unavailable (no Input
+/// Monitoring permission) and acts as a slow safety net while it runs. Reading
+/// the cursor through CoreGraphics needs no main-thread round trip.
+fn passthrough_fallback(app: AppHandle) {
+    let mut last_cursor = None;
+    let mut moved_at: Option<Instant> = None;
+    let mut geometry_at = Instant::now();
+    loop {
+        let state = app.state::<WindowState>();
+        if state.stop.load(Ordering::Acquire) || app.get_webview_window("main").is_none() {
+            break;
+        }
+        let now = Instant::now();
+        let cursor = crate::input::cursor_location();
+        if cursor != last_cursor {
+            last_cursor = cursor;
+            moved_at = Some(now);
+        }
+        if let Some((x, y)) = cursor {
+            if let Err(error) = apply_passthrough(&app, x, y) {
+                eprintln!("Hit region update stopped: {error}");
+                break;
             }
         }
-    });
-    Ok(())
+        let moving = moved_at.is_some_and(|at| now.duration_since(at) < PASSTHROUGH_SETTLE);
+        // Window moves arrive as events; this only covers display changes that
+        // shift the window's global origin without one, and only while in use.
+        if moving && now.duration_since(geometry_at) >= GEOMETRY_SAFETY_REFRESH {
+            geometry_at = now;
+            let handle = app.clone();
+            if let Err(error) = app.run_on_main_thread(move || {
+                if let Err(error) = refresh_main_layout(&handle) {
+                    eprintln!("Could not refresh main geometry: {error}");
+                }
+            }) {
+                eprintln!("Could not schedule main geometry refresh: {error}");
+            }
+        }
+        let tap_active = state
+            .cursor_observed_at
+            .lock()
+            .ok()
+            .and_then(|observed| *observed)
+            .is_some_and(|at| now.duration_since(at) < PASSTHROUGH_SETTLE);
+        std::thread::sleep(passthrough_poll_interval(tap_active, moving));
+    }
+}
+
+fn passthrough_poll_interval(tap_active: bool, moving: bool) -> Duration {
+    if tap_active {
+        PASSTHROUGH_TAP_POLL
+    } else if moving {
+        PASSTHROUGH_MOVING_POLL
+    } else {
+        PASSTHROUGH_IDLE_POLL
+    }
 }
 
 #[cfg(test)]
@@ -922,6 +1087,19 @@ mod tests {
         for label in ["panel", "login", "about", "update", "toast"] {
             assert_eq!(background_policy(label), None);
         }
+    }
+
+    #[test]
+    fn cursor_sampling_slows_down_when_idle_or_fed_by_the_input_tap() {
+        assert_eq!(
+            passthrough_poll_interval(false, true),
+            PASSTHROUGH_MOVING_POLL
+        );
+        assert_eq!(
+            passthrough_poll_interval(false, false),
+            PASSTHROUGH_IDLE_POLL
+        );
+        assert_eq!(passthrough_poll_interval(true, true), PASSTHROUGH_TAP_POLL);
     }
 
     #[test]

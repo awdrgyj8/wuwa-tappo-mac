@@ -23,6 +23,14 @@ impl HitRegion {
     pub fn contains(&self, x: f64, y: f64) -> bool {
         x >= self.left && y >= self.top && x < self.left + self.width && y < self.top + self.height
     }
+
+    /// Whether a point lies inside the region grown by `margin` on every side.
+    pub fn near(&self, x: f64, y: f64, margin: f64) -> bool {
+        x >= self.left - margin
+            && y >= self.top - margin
+            && x < self.left + self.width + margin
+            && y < self.top + self.height + margin
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize)]
@@ -63,6 +71,22 @@ mod tests {
         assert!(!region.contains(30.0, 50.0));
         assert!(!region.contains(0.0, 70.0));
         assert_eq!(serde_json::to_value(region).unwrap()["memberId"], 7);
+    }
+
+    #[test]
+    fn proximity_grows_regions_symmetrically() {
+        let region = HitRegion {
+            left: 100.0,
+            top: 100.0,
+            width: 50.0,
+            height: 50.0,
+            member_id: None,
+        };
+        assert!(region.near(60.0, 60.0, 40.0));
+        assert!(region.near(189.0, 189.0, 40.0));
+        assert!(!region.near(190.0, 120.0, 40.0));
+        assert!(!region.near(59.0, 120.0, 40.0));
+        assert!(region.near(120.0, 120.0, 0.0));
     }
 
     #[test]

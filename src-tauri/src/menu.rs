@@ -15,7 +15,7 @@ const AUTO_CHEST_RECORD_PREFIX: &str = "auto-chest-record-";
 const AUTO_CHEST_ENTRY_LIMIT: usize = 5;
 const AUTO_CHEST_TEXT_LIMIT: usize = 120;
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 struct Labels {
     open_bag: String,
@@ -83,7 +83,7 @@ impl Default for Labels {
     }
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 struct MenuOptions {
     labels: Labels,
@@ -555,10 +555,17 @@ pub fn sync(app: &AppHandle, args: &Value) -> Result<Value, String> {
     let state = app
         .try_state::<MenuState>()
         .ok_or("native menu not initialized")?;
-    *state
-        .options
-        .lock()
-        .map_err(|_| "native menu state poisoned")? = options;
+    {
+        let mut current = state
+            .options
+            .lock()
+            .map_err(|_| "native menu state poisoned")?;
+        if *current == options {
+            // Rebuilding three menus on the main thread for identical options is waste.
+            return Ok(Value::Null);
+        }
+        *current = options;
+    }
     rebuild(app, &state)
 }
 
@@ -567,10 +574,16 @@ pub fn sync_auto_chest(app: &AppHandle, args: &Value) -> Result<Value, String> {
     let state = app
         .try_state::<MenuState>()
         .ok_or("native menu not initialized")?;
-    *state
-        .auto_chest
-        .lock()
-        .map_err(|_| "native menu state poisoned")? = Some(chest);
+    {
+        let mut current = state
+            .auto_chest
+            .lock()
+            .map_err(|_| "native menu state poisoned")?;
+        if current.as_ref() == Some(&chest) {
+            return Ok(Value::Null);
+        }
+        *current = Some(chest);
+    }
     rebuild(app, &state)
 }
 

@@ -4,12 +4,22 @@ use std::{
     ffi::c_void,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc::{self, RecvTimeoutError},
+        Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager};
+
+// Every native event becomes one WKWebView evaluateJavaScript. While macOS reports
+// the desktop window as occluded, WebKit raises the WebContent process to the
+// foreground for each script and drops it again afterwards, so each delivery costs
+// RunningBoard, WindowServer and logd work. Raw mouse movement (60-1000 Hz) is
+// therefore coalesced to the latest position and paced by what it can affect.
+const DRAG_MOVE_INTERVAL: Duration = Duration::from_millis(16);
+const NEAR_MOVE_INTERVAL: Duration = Duration::from_millis(33);
+const IDLE_MOVE_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct InputStatus {
@@ -72,6 +82,8 @@ struct MouseButton {
 
 type MemberResolver = Arc<dyn Fn(f64, f64) -> Option<u64> + Send + Sync>;
 type AuxiliaryHitTest = Arc<dyn Fn(f64, f64) -> bool + Send + Sync>;
+type InteractiveHitTest = Arc<dyn Fn(f64, f64) -> bool + Send + Sync>;
+type CursorObserver = Arc<dyn Fn(f64, f64) + Send + Sync>;
 
 struct MonitorState {
     running: AtomicBool,
@@ -83,9 +95,27 @@ struct MonitorState {
     error: Mutex<Option<String>>,
     member_resolver: Mutex<Option<MemberResolver>>,
     auxiliary_hit_test: Mutex<Option<AuxiliaryHitTest>>,
+    interactive_hit_test: Mutex<Option<InteractiveHitTest>>,
+    cursor_observer: Mutex<Option<CursorObserver>>,
 }
 
 impl MonitorState {
+    fn new() -> Self {
+        Self {
+            running: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            scale: AtomicU64::new(1.0f64.to_bits()),
+            window_listener_installed: AtomicBool::new(false),
+            run_loop: Mutex::new(0),
+            event_tap: Mutex::new(0),
+            error: Mutex::new(None),
+            member_resolver: Mutex::new(None),
+            auxiliary_hit_test: Mutex::new(None),
+            interactive_hit_test: Mutex::new(None),
+            cursor_observer: Mutex::new(None),
+        }
+    }
+
     fn error(&self, message: String) {
         if let Ok(mut error) = self.error.lock() {
             *error = Some(message);
@@ -137,17 +167,7 @@ impl Default for InputMonitor {
 impl InputMonitor {
     pub fn new() -> Self {
         Self {
-            state: Arc::new(MonitorState {
-                running: AtomicBool::new(false),
-                stop: AtomicBool::new(false),
-                scale: AtomicU64::new(1.0f64.to_bits()),
-                window_listener_installed: AtomicBool::new(false),
-                run_loop: Mutex::new(0),
-                event_tap: Mutex::new(0),
-                error: Mutex::new(None),
-                member_resolver: Mutex::new(None),
-                auxiliary_hit_test: Mutex::new(None),
-            }),
+            state: Arc::new(MonitorState::new()),
             worker: Mutex::new(None),
         }
     }
@@ -173,6 +193,32 @@ impl InputMonitor {
             .auxiliary_hit_test
             .lock()
             .map_err(|_| "input_auxiliary_hit_test_lock_poisoned")? = Some(Arc::new(hit_test));
+        Ok(())
+    }
+
+    /// Main-window physical coordinates near interactive pet or dock content.
+    pub fn set_interactive_hit_test<F>(&self, hit_test: F) -> Result<(), String>
+    where
+        F: Fn(f64, f64) -> bool + Send + Sync + 'static,
+    {
+        *self
+            .state
+            .interactive_hit_test
+            .lock()
+            .map_err(|_| "input_interactive_hit_test_lock_poisoned")? = Some(Arc::new(hit_test));
+        Ok(())
+    }
+
+    /// Receives every raw cursor location (global logical points) before pacing.
+    pub fn set_cursor_observer<F>(&self, observer: F) -> Result<(), String>
+    where
+        F: Fn(f64, f64) + Send + Sync + 'static,
+    {
+        *self
+            .state
+            .cursor_observer
+            .lock()
+            .map_err(|_| "input_cursor_observer_lock_poisoned")? = Some(Arc::new(observer));
         Ok(())
     }
 
@@ -281,7 +327,8 @@ pub fn start(app: AppHandle) -> Result<InputStatus, String> {
     monitor.start(app.clone())
 }
 
-#[tauri::command]
+// Polled by the main window; the permission preflight need not occupy the main thread.
+#[tauri::command(async)]
 pub fn get_input_status(app: AppHandle) -> InputStatus {
     app.state::<InputMonitor>().status()
 }
@@ -522,9 +569,11 @@ fn run_monitor(
         state.stop.store(true, Ordering::Release);
     }
     // Bounded native run-loop iterations also observe a stop that races entry.
+    // wake_and_stop interrupts a running iteration, so the bound only matters in
+    // that race; one second keeps the idle thread from waking four times a second.
     while !state.stop.load(Ordering::Acquire) {
         unsafe {
-            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, 0);
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, 0);
         }
     }
     context.release_keys();
@@ -597,10 +646,104 @@ impl MouseRouting {
     }
 
     fn movement(&self, over_auxiliary: bool) -> bool {
+        self.main_button_held() || (self.pressed.is_empty() && !over_auxiliary)
+    }
+
+    fn main_button_held(&self) -> bool {
         self.pressed
             .values()
             .any(|target| *target == MouseTarget::Main)
-            || (self.pressed.is_empty() && !over_auxiliary)
+    }
+}
+
+/// How quickly the frontend needs fresh cursor positions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MovePace {
+    /// A main-owned button is held: pet and dock drags follow the display rate.
+    Drag,
+    /// Over or near pet/dock content: hover, cursor shape and member routing.
+    Near,
+    /// Elsewhere on the desktop: the frontend only tracks the last position.
+    Idle,
+}
+
+impl MovePace {
+    fn interval(self) -> Duration {
+        match self {
+            Self::Drag => DRAG_MOVE_INTERVAL,
+            Self::Near => NEAR_MOVE_INTERVAL,
+            Self::Idle => IDLE_MOVE_INTERVAL,
+        }
+    }
+}
+
+/// The frontend rounds coordinates, so sub-pixel jitter carries no new state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MoveKey {
+    x: i64,
+    y: i64,
+    member_id: Option<u64>,
+}
+
+impl MoveKey {
+    fn of(position: &MousePosition) -> Self {
+        Self {
+            x: position.x.round() as i64,
+            y: position.y.round() as i64,
+            member_id: position.member_id,
+        }
+    }
+}
+
+/// Coalesces routed movement to the newest position and paces its delivery.
+/// Keys and buttons are never delayed; a button flushes the position it needs.
+#[derive(Default)]
+struct MoveThrottle {
+    pending: Option<(MousePosition, MovePace)>,
+    delivered: Option<(MoveKey, MovePace, Instant)>,
+}
+
+impl MoveThrottle {
+    fn queue(&mut self, position: MousePosition, pace: MovePace) {
+        if self
+            .delivered
+            .is_some_and(|(key, ..)| key == MoveKey::of(&position))
+        {
+            // Back at the last delivered point: the frontend already has it.
+            self.pending = None;
+        } else {
+            self.pending = Some((position, pace));
+        }
+    }
+
+    fn due_at(&self, now: Instant) -> Option<Instant> {
+        let (_, pace) = self.pending?;
+        Some(match self.delivered {
+            // Entering or leaving pet content, or starting/ending a drag, uses the
+            // faster pace so the transition arrives promptly; jitter on a zone edge
+            // still cannot exceed that pace.
+            Some((_, delivered_pace, at)) => at + pace.interval().min(delivered_pace.interval()),
+            None => now,
+        })
+    }
+
+    fn take_due(&mut self, now: Instant) -> Option<MousePosition> {
+        if self.due_at(now)? > now {
+            return None;
+        }
+        let (position, pace) = self.pending.take()?;
+        self.delivered = Some((MoveKey::of(&position), pace, now));
+        Some(position)
+    }
+
+    /// Records the position a button carries; returns whether it must be sent.
+    fn lead_button(&mut self, position: MousePosition, pace: MovePace, now: Instant) -> bool {
+        self.pending = None;
+        let needed = self
+            .delivered
+            .is_none_or(|(key, ..)| key != MoveKey::of(&position));
+        self.delivered = Some((MoveKey::of(&position), pace, now));
+        needed
     }
 }
 
@@ -664,54 +807,71 @@ fn route_event(
     }
 }
 
-/// The pet view hit-tests the DOM for every global mouse move; one per display frame is
-/// enough, while high-polling-rate mice can report up to 1000 moves a second.
-const MOVE_EMIT_INTERVAL: Duration = Duration::from_millis(16);
-
-/// Coalesces mouse moves so at most one is delivered per interval. The newest position
-/// always wins and is delivered no later than one interval after the previous one.
-struct MoveThrottle<T> {
-    pending: Option<T>,
-    last: Option<Instant>,
+fn observe_cursor(event: &NativeInput, state: &MonitorState) -> Result<(), String> {
+    let point = match event {
+        NativeInput::Move(point) | NativeInput::Button { point, .. } => *point,
+        NativeInput::Key { .. } => return Ok(()),
+    };
+    let observer = state
+        .cursor_observer
+        .lock()
+        .map_err(|_| "input_cursor_observer_lock_poisoned")?
+        .clone();
+    if let Some(observer) = observer {
+        observer(point.x, point.y);
+    }
+    Ok(())
 }
 
-impl<T> MoveThrottle<T> {
-    fn new() -> Self {
-        Self {
-            pending: None,
-            last: None,
+fn move_pace(
+    position: &MousePosition,
+    routing: &MouseRouting,
+    state: &MonitorState,
+) -> Result<MovePace, String> {
+    if routing.main_button_held() {
+        return Ok(MovePace::Drag);
+    }
+    if position.member_id.is_some() {
+        return Ok(MovePace::Near);
+    }
+    let hit_test = state
+        .interactive_hit_test
+        .lock()
+        .map_err(|_| "input_interactive_hit_test_lock_poisoned")?
+        .clone();
+    // Without layout information keep the responsive pace rather than guessing.
+    Ok(match hit_test {
+        Some(hit_test) if !hit_test(position.x, position.y) => MovePace::Idle,
+        _ => MovePace::Near,
+    })
+}
+
+fn deliver(
+    app: &AppHandle,
+    event: RoutedInput,
+    routing: &MouseRouting,
+    moves: &mut MoveThrottle,
+    state: &MonitorState,
+) -> Result<(), String> {
+    match event {
+        RoutedInput::Key { key, pressed } => app
+            .emit(if pressed { "key-press" } else { "key-release" }, key)
+            .map_err(|error| error.to_string()),
+        RoutedInput::Move(position) => {
+            moves.queue(position, move_pace(&position, routing, state)?);
+            Ok(())
         }
-    }
-
-    fn offer(&mut self, now: Instant, position: T) -> Option<T> {
-        let ready = self
-            .last
-            .is_none_or(|last| now.saturating_duration_since(last) >= MOVE_EMIT_INTERVAL);
-        if self.pending.is_none() && ready {
-            self.last = Some(now);
-            return Some(position);
+        RoutedInput::Button { position, button } => {
+            // Keep global cursor state current before the main-owned button event,
+            // without repeating a position the frontend already holds.
+            let pace = move_pace(&position, routing, state)?;
+            if moves.lead_button(position, pace, Instant::now()) {
+                app.emit("mouse-move", position)
+                    .map_err(|error| error.to_string())?;
+            }
+            app.emit("mouse-button", button)
+                .map_err(|error| error.to_string())
         }
-        self.pending = Some(position);
-        None
-    }
-
-    fn deadline(&self) -> Option<Instant> {
-        self.pending.as_ref()?;
-        self.last.map(|last| last + MOVE_EMIT_INTERVAL)
-    }
-
-    fn take_due(&mut self, now: Instant) -> Option<T> {
-        if self.deadline().is_some_and(|deadline| now >= deadline) {
-            self.last = Some(now);
-            return self.pending.take();
-        }
-        None
-    }
-
-    /// A button event carries a newer position of its own.
-    fn supersede(&mut self, now: Instant) {
-        self.pending = None;
-        self.last = Some(now);
     }
 }
 
@@ -721,54 +881,36 @@ fn dispatch_events(
     receiver: mpsc::Receiver<NativeInput>,
 ) {
     let mut routing = MouseRouting::default();
-    let mut moves = MoveThrottle::new();
+    let mut moves = MoveThrottle::default();
     loop {
-        let received = match moves.deadline() {
-            Some(deadline) => {
-                match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                    Ok(event) => Some(event),
-                    Err(mpsc::RecvTimeoutError::Timeout) => None,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        let now = Instant::now();
+        let next = match moves.due_at(now) {
+            Some(due) if due <= now => Err(RecvTimeoutError::Timeout),
+            Some(due) => receiver.recv_timeout(due - now),
+            None => receiver.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        let result = match next {
+            Ok(event) => {
+                if let Err(error) = observe_cursor(&event, &state) {
+                    state.error(format!("input_cursor_observer_failed: {error}"));
+                }
+                match route_event(event, &mut routing, &state) {
+                    Ok(Some(event)) => deliver(&app, event, &routing, &mut moves, &state),
+                    Ok(None) => Ok(()),
+                    Err(error) => {
+                        state.error(format!("input_event_route_failed: {error}"));
+                        state.wake_and_stop();
+                        break;
+                    }
                 }
             }
-            None => match receiver.recv() {
-                Ok(event) => Some(event),
-                Err(_) => break,
-            },
-        };
-        let Some(event) = received else {
-            if let Some(position) = moves.take_due(Instant::now()) {
-                if let Err(error) = app.emit("mouse-move", position) {
-                    state.error(format!("input_event_delivery_failed: {error}"));
-                    state.wake_and_stop();
-                    break;
-                }
-            }
-            continue;
-        };
-        let event = match route_event(event, &mut routing, &state) {
-            Ok(Some(event)) => event,
-            Ok(None) => continue,
-            Err(error) => {
-                state.error(format!("input_event_route_failed: {error}"));
-                state.wake_and_stop();
-                break;
-            }
-        };
-        let result = match event {
-            RoutedInput::Key { key, pressed } => {
-                app.emit(if pressed { "key-press" } else { "key-release" }, key)
-            }
-            RoutedInput::Move(position) => match moves.offer(Instant::now(), position) {
-                Some(position) => app.emit("mouse-move", position),
+            Err(RecvTimeoutError::Timeout) => match moves.take_due(Instant::now()) {
+                Some(position) => app
+                    .emit("mouse-move", position)
+                    .map_err(|error| error.to_string()),
                 None => Ok(()),
             },
-            RoutedInput::Button { position, button } => {
-                moves.supersede(Instant::now());
-                // Keep global cursor state current before the main-owned button event.
-                app.emit("mouse-move", position)
-                    .and_then(|_| app.emit("mouse-button", button))
-            }
+            Err(RecvTimeoutError::Disconnected) => break,
         };
         if let Err(error) = result {
             state.error(format!("input_event_delivery_failed: {error}"));
@@ -1004,36 +1146,127 @@ unsafe extern "C" {
 mod tests {
     use super::*;
 
-    #[test]
-    fn mouse_moves_are_limited_to_one_per_frame_with_the_newest_position() {
-        let start = Instant::now();
-        let ms = |value: u64| start + Duration::from_millis(value);
-        let mut moves = MoveThrottle::new();
-        assert_eq!(moves.offer(ms(0), 1), Some(1));
-        assert_eq!(moves.deadline(), None);
-        assert_eq!(moves.offer(ms(1), 2), None);
-        assert_eq!(moves.offer(ms(5), 3), None);
-        assert_eq!(moves.deadline(), Some(ms(16)));
-        assert_eq!(moves.take_due(ms(15)), None);
-        assert_eq!(moves.take_due(ms(16)), Some(3));
-        assert_eq!(moves.deadline(), None);
-        assert_eq!(moves.offer(ms(20), 4), None, "still within one frame of the last move");
-        assert_eq!(moves.offer(ms(40), 5), None, "a pending move keeps its deadline");
-        assert_eq!(moves.take_due(ms(40)), Some(5));
-        assert_eq!(moves.offer(ms(100), 6), Some(6), "an idle cursor is delivered at once");
+    fn at(x: f64, y: f64) -> MousePosition {
+        MousePosition {
+            x,
+            y,
+            member_id: None,
+        }
     }
 
     #[test]
-    fn button_positions_replace_pending_moves() {
+    fn idle_movement_is_coalesced_to_the_latest_position_per_interval() {
         let start = Instant::now();
-        let mut moves = MoveThrottle::new();
-        assert_eq!(moves.offer(start, 1), Some(1));
-        assert_eq!(moves.offer(start + Duration::from_millis(2), 2), None);
-        moves.supersede(start + Duration::from_millis(3));
-        assert_eq!(moves.deadline(), None);
-        assert_eq!(moves.take_due(start + Duration::from_secs(1)), None);
-        assert_eq!(moves.offer(start + Duration::from_millis(10), 3), None);
-        assert_eq!(moves.take_due(start + Duration::from_millis(19)), Some(3));
+        let mut moves = MoveThrottle::default();
+        moves.queue(at(10.0, 10.0), MovePace::Idle);
+        assert_eq!(moves.take_due(start), Some(at(10.0, 10.0)));
+        // A burst of raw events inside one interval produces no delivery...
+        for step in 1..=50 {
+            moves.queue(at(10.0 + step as f64, 10.0), MovePace::Idle);
+            assert_eq!(moves.take_due(start + Duration::from_millis(step)), None);
+        }
+        // ...and only the newest position once the interval elapses.
+        let due = moves.due_at(start).unwrap();
+        assert_eq!(due, start + IDLE_MOVE_INTERVAL);
+        assert_eq!(moves.take_due(due), Some(at(60.0, 10.0)));
+        assert_eq!(moves.take_due(due + IDLE_MOVE_INTERVAL), None);
+    }
+
+    #[test]
+    fn subpixel_jitter_and_returning_to_the_delivered_point_send_nothing() {
+        let start = Instant::now();
+        let mut moves = MoveThrottle::default();
+        moves.queue(at(100.2, 50.4), MovePace::Near);
+        assert!(moves.take_due(start).is_some());
+        moves.queue(at(99.8, 49.6), MovePace::Near);
+        assert_eq!(moves.due_at(start), None);
+        moves.queue(at(140.0, 50.0), MovePace::Near);
+        moves.queue(at(100.0, 50.0), MovePace::Near);
+        assert_eq!(moves.due_at(start), None);
+    }
+
+    #[test]
+    fn approaching_pet_content_is_delivered_at_the_responsive_pace() {
+        let start = Instant::now();
+        let mut moves = MoveThrottle::default();
+        moves.queue(at(500.0, 500.0), MovePace::Idle);
+        assert!(moves.take_due(start).is_some());
+        moves.queue(at(120.0, 80.0), MovePace::Near);
+        assert_eq!(moves.due_at(start), Some(start + NEAR_MOVE_INTERVAL));
+        // Leaving pet content is also a transition and is not held for the idle pace.
+        let entered = start + NEAR_MOVE_INTERVAL;
+        assert!(moves.take_due(entered).is_some());
+        moves.queue(at(900.0, 900.0), MovePace::Idle);
+        assert_eq!(moves.due_at(entered), Some(entered + NEAR_MOVE_INTERVAL));
+    }
+
+    #[test]
+    fn drags_follow_display_rate_and_buttons_flush_without_duplicates() {
+        let start = Instant::now();
+        let mut moves = MoveThrottle::default();
+        assert!(moves.lead_button(at(40.0, 40.0), MovePace::Drag, start));
+        moves.queue(at(41.0, 40.0), MovePace::Drag);
+        assert_eq!(moves.due_at(start), Some(start + DRAG_MOVE_INTERVAL));
+        // The release carries its own position and supersedes the pending move.
+        assert!(moves.lead_button(at(45.0, 40.0), MovePace::Near, start));
+        assert_eq!(moves.due_at(start), None);
+        // A click at the already delivered position needs no extra mouse-move.
+        assert!(!moves.lead_button(at(45.2, 39.8), MovePace::Drag, start));
+    }
+
+    #[test]
+    fn pace_follows_drag_ownership_member_hover_and_interactive_layout() {
+        let (context, _) = test_context();
+        let state = context.state;
+        let mut routing = MouseRouting::default();
+        // No layout yet: stay responsive.
+        assert_eq!(
+            move_pace(&at(0.0, 0.0), &routing, &state).unwrap(),
+            MovePace::Near
+        );
+        *state.interactive_hit_test.lock().unwrap() = Some(Arc::new(|x, _| x < 100.0));
+        assert_eq!(
+            move_pace(&at(50.0, 0.0), &routing, &state).unwrap(),
+            MovePace::Near
+        );
+        assert_eq!(
+            move_pace(&at(500.0, 0.0), &routing, &state).unwrap(),
+            MovePace::Idle
+        );
+        let member = MousePosition {
+            member_id: Some(3),
+            ..at(500.0, 0.0)
+        };
+        assert_eq!(
+            move_pace(&member, &routing, &state).unwrap(),
+            MovePace::Near
+        );
+        assert!(routing.button("left", true, false));
+        assert_eq!(
+            move_pace(&at(500.0, 0.0), &routing, &state).unwrap(),
+            MovePace::Drag
+        );
+    }
+
+    #[test]
+    fn cursor_observer_sees_raw_logical_points_but_not_keys() {
+        let (context, _) = test_context();
+        let state = context.state;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        *state.cursor_observer.lock().unwrap() =
+            Some(Arc::new(move |x, y| sink.lock().unwrap().push((x, y))));
+        state.scale.store(2.0f64.to_bits(), Ordering::Release);
+        observe_cursor(&NativeInput::Move(Point { x: 3.0, y: 4.0 }), &state).unwrap();
+        observe_cursor(
+            &NativeInput::Key {
+                key: "a".into(),
+                pressed: true,
+            },
+            &state,
+        )
+        .unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![(3.0, 4.0)]);
     }
 
     struct TestEvent(*mut c_void);
@@ -1046,17 +1279,7 @@ mod tests {
     }
 
     fn test_context() -> (TapContext, mpsc::Receiver<NativeInput>) {
-        let state = Arc::new(MonitorState {
-            running: AtomicBool::new(false),
-            stop: AtomicBool::new(false),
-            scale: AtomicU64::new(1.0f64.to_bits()),
-            window_listener_installed: AtomicBool::new(false),
-            run_loop: Mutex::new(0),
-            event_tap: Mutex::new(0),
-            error: Mutex::new(None),
-            member_resolver: Mutex::new(None),
-            auxiliary_hit_test: Mutex::new(None),
-        });
+        let state = Arc::new(MonitorState::new());
         let (sender, receiver) = mpsc::channel();
         (
             TapContext {

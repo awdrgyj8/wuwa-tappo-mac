@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, State, WebviewWindow};
 
 const ACCOUNT: &str = "webview-session-v1";
 const ITEM_NOT_FOUND: i32 = -25300;
@@ -27,7 +27,7 @@ pub struct SessionCookie {
     same_site: Option<String>,
 }
 
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionSnapshot {
     revision: u64,
@@ -138,6 +138,14 @@ fn transaction(
 ) -> Result<SessionSnapshot, String> {
     let mut next = current.clone();
     apply_mutation(&mut next, mutation, now)?;
+    let mut unchanged = current.clone();
+    remove_expired(&mut unchanged, now);
+    unchanged.revision = next.revision;
+    if unchanged == next {
+        // Rewriting an identical cookie or secure value changes nothing the
+        // windows can observe: skip the Keychain write and the broadcast.
+        return Ok(current.clone());
+    }
     if next.persistence == SessionPersistence::Keychain {
         let mut durable = next.clone();
         durable.cookies.retain(|cookie| cookie.expires_at.is_some());
@@ -230,31 +238,32 @@ impl SessionStore {
             .replace("__WUWATAPPO_SESSION_SNAPSHOT__", &snapshot))
     }
 
-    fn apply(&self, mutation: SessionMutation) -> Result<SessionSnapshot, String> {
+    /// Returns the resulting snapshot and whether the mutation changed it.
+    fn apply(&self, mutation: SessionMutation) -> Result<(SessionSnapshot, bool), String> {
         let mut current = self
             .inner
             .lock()
             .map_err(|_| "App sign-in session lock failed".to_owned())?;
-        transaction(
-            &mut current,
-            mutation,
-            now_millis(),
-            |snapshot| match &self.backend {
-                SessionBackend::Memory => Ok(()),
-                SessionBackend::Keychain { service } => persist_snapshot(
-                    snapshot,
-                    |bytes| {
-                        set_generic_password(service, ACCOUNT, bytes).map_err(|error| {
-                            format!(
-                                "Cannot save app sign-in data in Keychain (OSStatus {})",
-                                error.code()
-                            )
-                        })
-                    },
-                    || deletion_result(delete_generic_password(service, ACCOUNT)),
-                ),
-            },
-        )
+        let before = current.revision;
+        let snapshot = transaction(&mut current, mutation, now_millis(), |snapshot| match &self
+            .backend
+        {
+            SessionBackend::Memory => Ok(()),
+            SessionBackend::Keychain { service } => persist_snapshot(
+                snapshot,
+                |bytes| {
+                    set_generic_password(service, ACCOUNT, bytes).map_err(|error| {
+                        format!(
+                            "Cannot save app sign-in data in Keychain (OSStatus {})",
+                            error.code()
+                        )
+                    })
+                },
+                || deletion_result(delete_generic_password(service, ACCOUNT)),
+            ),
+        })?;
+        let changed = snapshot.revision != before;
+        Ok((snapshot, changed))
     }
 }
 
@@ -277,7 +286,8 @@ fn require_app_window(window: &WebviewWindow) -> Result<(), String> {
     }
 }
 
-#[tauri::command]
+// Off the main thread: a Keychain write in progress holds the session lock.
+#[tauri::command(async)]
 pub fn session_snapshot(
     window: WebviewWindow,
     store: State<'_, SessionStore>,
@@ -295,15 +305,13 @@ pub async fn session_apply(
 ) -> Result<SessionSnapshot, String> {
     require_app_window(&window)?;
     let store = store.inner().clone();
-    let snapshot = tauri::async_runtime::spawn_blocking(move || store.apply(mutation))
+    let (snapshot, changed) = tauri::async_runtime::spawn_blocking(move || store.apply(mutation))
         .await
         .map_err(|_| "App sign-in keychain worker failed".to_owned())??;
-    for window in app
-        .webview_windows()
-        .values()
-        .filter(|window| trusted_window(window))
-    {
-        window.emit(CHANGE_EVENT, &snapshot).map_err(|_| {
+    if changed {
+        // One emit already reaches every window whose session bridge listens
+        // (target Any); emitting per window repeated it N times to each of them.
+        app.emit(CHANGE_EVENT, &snapshot).map_err(|_| {
             "App sign-in data was saved but could not be synchronized to an app window".to_owned()
         })?;
     }
@@ -583,6 +591,36 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.contains("OSStatus -25293"));
+    }
+
+    #[test]
+    fn identical_mutations_neither_persist_nor_advance_the_revision() {
+        let keychain = MockKeychain::default();
+        let mut state = SessionSnapshot::default();
+        let set = || SessionMutation::SetCookie {
+            cookie: cookie(Some(5000)),
+        };
+        transaction(&mut state, set(), 1000, |saved| keychain.persist(saved)).unwrap();
+        assert_eq!((state.revision, keychain.writes.get()), (1, 1));
+        let repeated =
+            transaction(&mut state, set(), 1000, |saved| keychain.persist(saved)).unwrap();
+        assert_eq!((repeated.revision, keychain.writes.get()), (1, 1));
+        let clear = transaction(&mut state, SessionMutation::ClearStorage, 1000, |saved| {
+            keychain.persist(saved)
+        })
+        .unwrap();
+        assert_eq!((clear.revision, keychain.writes.get()), (1, 1));
+        // A refreshed expiry is a real change and is still saved.
+        transaction(
+            &mut state,
+            SessionMutation::SetCookie {
+                cookie: cookie(Some(9000)),
+            },
+            1000,
+            |saved| keychain.persist(saved),
+        )
+        .unwrap();
+        assert_eq!((state.revision, keychain.writes.get()), (2, 2));
     }
 
     #[test]

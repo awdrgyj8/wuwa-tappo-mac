@@ -33,7 +33,30 @@
     };
   }
 
+  // An error thrown on a per-event path must not become one disk write per event.
+  const diagnosticWindow = { started: 0, written: 0, suppressed: false };
+  const maxDiagnosticsPerMinute = 30;
+
+  function diagnosticAllowed() {
+    const now = Date.now();
+    if (now - diagnosticWindow.started >= 60000) {
+      diagnosticWindow.started = now;
+      diagnosticWindow.written = 0;
+      diagnosticWindow.suppressed = false;
+    }
+    if (diagnosticWindow.written < maxDiagnosticsPerMinute) {
+      diagnosticWindow.written += 1;
+      return true;
+    }
+    return false;
+  }
+
   function writeDiagnostic(message) {
+    if (!diagnosticAllowed()) {
+      if (diagnosticWindow.suppressed) return;
+      diagnosticWindow.suppressed = true;
+      message = '[webview] Further diagnostics suppressed for one minute';
+    }
     const invoke = window.__TAURI_INTERNALS__?.invoke ?? window.__TAURI__?.core?.invoke;
     if (typeof invoke !== 'function') {
       console.error('[macOS] Diagnostic bridge unavailable');
@@ -79,6 +102,7 @@
     if (!api) return;
     let attemptedRecovery = false;
     let checking = false;
+    let checkedAt = 0;
     let previousStatus;
     let inputMessage = null;
     let shortcutMessage = null;
@@ -134,6 +158,7 @@
     const check = async () => {
       if (checking) return;
       checking = true;
+      checkedAt = Date.now();
       try {
         const status = await api.core.invoke('get_input_status');
         update(status);
@@ -149,7 +174,11 @@
       await api.event.listen('mac-input-status', event => update(event.payload));
       await check();
       if (isMainWindow) {
-        const timer = window.setInterval(check, 2000);
+        // While paused, notice a newly granted permission quickly. While running,
+        // native code reports tap loss itself (mac-input-status), so the status
+        // command only needs an occasional safety check.
+        const poll = () => (state.nativeInput && Date.now() - checkedAt < 30000 ? undefined : check());
+        const timer = window.setInterval(poll, 2000);
         window.addEventListener('pagehide', () => window.clearInterval(timer), { once: true });
       }
     } catch (error) {

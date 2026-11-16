@@ -184,6 +184,27 @@ test('granting input access resumes once and removes the paused warning', async 
   assert.equal(view.tick(), undefined);
 });
 
+test('running input is rechecked occasionally instead of every poll', async () => {
+  const view = webview({ readyState: 'complete', inputStatus: true });
+  await drain();
+  const statusChecks = () => view.calls.filter(call => call.command === 'get_input_status').length;
+  assert.equal(statusChecks(), 1);
+  for (let index = 0; index < 5; index += 1) await view.tick();
+  assert.equal(statusChecks(), 1);
+  view.updateInput(false);
+  await view.tick();
+  assert.equal(statusChecks(), 2);
+});
+
+test('an error storm is capped instead of writing one diagnostic per event', async () => {
+  const view = webview();
+  for (let index = 0; index < 100; index += 1) view.emit('error', { error: new Error(`failure ${index}`) });
+  await drain();
+  const logs = view.logs();
+  assert.equal(logs.length, 31);
+  assert.equal(logs.at(-1), '[webview] Further diagnostics suppressed for one minute');
+});
+
 test('a failed input recovery stays visible without repeatedly rebuilding the tap', async () => {
   const status = { granted: true, running: false, error: 'input_event_tap_disabled' };
   const view = webview({ readyState: 'complete', inputStatus: status, resumeStatus: status });
